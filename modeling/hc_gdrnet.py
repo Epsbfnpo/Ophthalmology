@@ -88,6 +88,11 @@ class HCGDRNet(nn.Module):
         self.backbone = ResNetBackbone(pretrained=pretrained_backbone)
         self.decoder = UNetDecoder(in_channels=2048)
         self.projector = HierarchicalProjector(in_dim=2048, num_l1=num_l1_concepts, num_l2=num_l2_concepts)
+        self.feat_adapter = nn.Sequential(
+            nn.Linear(2048, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+        )
         self.classifier = nn.Linear(num_l2_concepts, num_classes)
         self.register_buffer("concept_bank", concept_bank)
 
@@ -102,7 +107,10 @@ class HCGDRNet(nn.Module):
         gated_feat = feat * mask_small
 
         pooled_feat = F.adaptive_avg_pool2d(gated_feat, 1).flatten(1)
+        vis_emb = self.feat_adapter(pooled_feat)
+        vis_emb = F.normalize(vis_emb, dim=1)
+
         z_l1, z_l2 = self.projector(pooled_feat)
         logits = self.classifier(torch.sigmoid(z_l2))
 
-        return feat, pred_mask, z_l1, z_l2, logits
+        return feat, pred_mask, z_l1, z_l2, logits, vis_emb

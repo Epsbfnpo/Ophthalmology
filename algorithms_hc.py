@@ -47,17 +47,24 @@ class HCMTLGGDRNetTrainer:
     def update(self, batch, optimizer, has_masks):
         images, masks, labels = [x.to(self.device) for x in batch]
 
-        s_feat, s_mask, s_z_l1, s_z_l2, s_logits = self.student(images)
+        s_feat, s_mask, s_z_l1, s_z_l2, s_logits, s_vis_emb = self.student(images)
         with torch.no_grad():
-            t_feat, _, _, _, _ = self.teacher(images)
+            t_feat, _, _, _, _, _ = self.teacher(images)
 
         loss_cls = F.cross_entropy(s_logits, labels)
-
         loss_seg = dice_loss(s_mask, masks) if has_masks else torch.tensor(0.0, device=self.device)
-
         loss_distill = F.mse_loss(s_feat, t_feat)
 
-        loss_concept = torch.tensor(0.0, device=self.device)
+        if self.bank_l1 is not None:
+            with torch.no_grad():
+                target_sim_l1 = s_vis_emb @ self.bank_l1.T
+                target_sim_l2 = s_vis_emb @ self.bank_l2.T
+
+            loss_concept_l1 = F.mse_loss(torch.sigmoid(s_z_l1), target_sim_l1)
+            loss_concept_l2 = F.mse_loss(torch.sigmoid(s_z_l2), target_sim_l2)
+            loss_concept = loss_concept_l1 + loss_concept_l2
+        else:
+            loss_concept = torch.tensor(0.0, device=self.device)
 
         probs_l2 = torch.sigmoid(s_z_l2)
         healthy_mask = labels == 0
@@ -72,6 +79,7 @@ class HCMTLGGDRNetTrainer:
             self.weights.cls * loss_cls
             + self.weights.seg * loss_seg
             + self.weights.distill * loss_distill
+            + self.weights.concept * loss_concept
             + self.weights.reg * loss_reg
             + self.weights.ib * loss_ib
         )
@@ -81,4 +89,9 @@ class HCMTLGGDRNetTrainer:
         optimizer.step()
         update_ema(self.student, self.teacher)
 
-        return {"loss": total_loss.item(), "seg": loss_seg.item(), "cls": loss_cls.item()}
+        return {
+            "loss": total_loss.item(),
+            "cls": loss_cls.item(),
+            "seg": loss_seg.item(),
+            "concept": loss_concept.item(),
+        }

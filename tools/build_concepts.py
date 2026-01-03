@@ -1,7 +1,7 @@
 import argparse
 
-import torch
 import open_clip
+import torch
 
 
 def main() -> None:
@@ -10,26 +10,34 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    concepts = [
-        "microaneurysms",
-        "hemorrhages",
-        "hard exudates",
-        "cotton wool spots",
-        "normal retina",
+    l1_concepts = [
+        "red lesions in retina",
+        "bright lesions in retina",
     ]
 
-    model, _, preprocess = open_clip.create_model_and_transforms("biomedclip", pretrained="openai")
+    l2_concepts = [
+        "microaneurysms",
+        "retinal hemorrhages",
+        "hard exudates",
+        "cotton wool spots",
+    ]
+
+    print(f"Generating embeddings for {len(l1_concepts)} L1 concepts and {len(l2_concepts)} L2 concepts...")
+
+    model, _, _ = open_clip.create_model_and_transforms("biomedclip", pretrained="openai")
     tokenizer = open_clip.get_tokenizer("biomedclip")
     model = model.to(args.device)
     model.eval()
 
+    all_concepts = l1_concepts + l2_concepts
+
     with torch.no_grad():
-        tokens = tokenizer(concepts).to(args.device)
+        tokens = tokenizer(all_concepts).to(args.device)
         text_features = model.encode_text(tokens)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
     torch.save(text_features.cpu(), args.output)
-    print(f"Saved concepts to {args.output}")
+    print(f"Saved concept bank shape: {text_features.shape} to {args.output}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+import os
 
 import torch
 from torch import nn
@@ -9,7 +10,19 @@ from torchvision import models
 class ResNetBackbone(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
+        resnet = models.resnet50(weights=None)
+
+        if pretrained:
+            weight_path = "resnet50.pth"
+            if os.path.exists(weight_path):
+                print(f"[Backbone] Loading local weights from {weight_path}")
+                state_dict = torch.load(weight_path, map_location="cpu")
+                resnet.load_state_dict(state_dict)
+            else:
+                raise FileNotFoundError(
+                    f"❌ Pretrained weights not found at {os.path.abspath(weight_path)}. "
+                    "Please run the download script on the login node first."
+                )
         self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
         self.layer1 = resnet.layer1
         self.layer2 = resnet.layer2

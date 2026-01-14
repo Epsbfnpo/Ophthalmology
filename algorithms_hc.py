@@ -28,6 +28,7 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
 
 
 def update_ema(student: nn.Module, teacher: nn.Module, momentum: float = 0.999):
+    # 兼容 DataParallel 的情况
     s_model = student.module if hasattr(student, "module") else student
     t_model = teacher.module if hasattr(teacher, "module") else teacher
 
@@ -44,6 +45,7 @@ class HCMTLGGDRNetTrainer:
         self.student = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4)
         self.teacher = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4)
 
+        # 自动检测多卡并行
         if torch.cuda.device_count() > 1:
             print(f"🔥 Trainer Detected {torch.cuda.device_count()} GPUs! Wrapping with DataParallel.")
             self.student = nn.DataParallel(self.student)
@@ -52,6 +54,7 @@ class HCMTLGGDRNetTrainer:
         self.student.to(device)
         self.teacher.to(device)
 
+        # 加载 Concept Bank (用于 Loss 计算)
         if concept_bank is not None:
             self.bank_l1 = concept_bank[:2].to(device)
             self.bank_l2 = concept_bank[2:].to(device)
@@ -59,6 +62,8 @@ class HCMTLGGDRNetTrainer:
             self.bank_l1 = None
             self.bank_l2 = None
 
+        # 初始化 Teacher 权重
+        # 注意：如果是 DataParallel，state_dict 也是兼容的
         self.teacher.load_state_dict(self.student.state_dict())
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -109,6 +114,27 @@ class HCMTLGGDRNetTrainer:
         loss_seg = dice_loss(s_pred_mask, masks) if has_masks else torch.tensor(0.0, device=self.device)
         loss_distill = F.mse_loss(s_vis_emb, t_vis_emb)
 
+        # D. Classification Path
+        s_pred_cls = model_core.classifier(s_z_l2)
+
+        # 2. Teacher Forward (EMA)
+        with torch.no_grad():
+            teacher_core = self.teacher.module if isinstance(self.teacher, nn.DataParallel) else self.teacher
+            t_feat = teacher_core.backbone(images)
+
+            # Teacher 也走一遍流程生成 vis_emb
+            t_pred_mask = teacher_core.decoder(t_feat, target_size=images.shape[-2:])
+            t_clean_mask = torch.sigmoid(t_pred_mask)
+            t_mask_small = F.interpolate(t_clean_mask, size=t_feat.shape[-2:], mode="nearest")
+            t_gated_feat = t_feat * t_mask_small
+            t_vis_emb = teacher_core.feat_adapter(t_gated_feat.mean(dim=(2, 3)))
+
+        # 3. Calculate Losses
+        loss_cls = F.cross_entropy(s_pred_cls, labels)
+        loss_seg = dice_loss(s_pred_mask, masks) if has_masks else torch.tensor(0.0, device=self.device)
+        loss_distill = F.mse_loss(s_vis_emb, t_vis_emb)
+
+        # Concept Loss (Alignment with CLIP)
         if self.bank_l1 is not None:
             s_vis_norm = F.normalize(s_vis_emb, dim=1)
             bank_l1_norm = F.normalize(self.bank_l1, dim=1)
@@ -126,6 +152,7 @@ class HCMTLGGDRNetTrainer:
         else:
             loss_concept = torch.tensor(0.0, device=self.device)
 
+        # Regularization Losses
         probs_l2 = torch.sigmoid(s_z_l2)
         healthy_mask = labels == 0
         if healthy_mask.any():
@@ -135,6 +162,7 @@ class HCMTLGGDRNetTrainer:
 
         loss_ib = probs_l2.abs().mean()
 
+        # Weighted Sum
         total_loss = (
             self.weights.cls * loss_cls
             + self.weights.seg * loss_seg
@@ -150,6 +178,7 @@ class HCMTLGGDRNetTrainer:
 
         update_ema(self.student, self.teacher)
 
+        # Return comprehensive metrics dict
         return {
             "loss": total_loss.item(),
             "loss_seg": loss_seg.item(),

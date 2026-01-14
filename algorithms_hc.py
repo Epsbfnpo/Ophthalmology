@@ -26,8 +26,10 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
 
 
 def update_ema(student: nn.Module, teacher: nn.Module, momentum: float = 0.999):
+    s_model = student.module if hasattr(student, "module") else student
+    t_model = teacher.module if hasattr(teacher, "module") else teacher
     with torch.no_grad():
-        for sp, tp in zip(student.parameters(), teacher.parameters()):
+        for sp, tp in zip(s_model.parameters(), t_model.parameters()):
             tp.data.mul_(momentum).add_(sp.data, alpha=1 - momentum)
 
 
@@ -35,14 +37,27 @@ class HCMTLGGDRNetTrainer:
     def __init__(self, concept_bank, device="cuda", weights: Optional[LossWeights] = None):
         self.device = device
         self.weights = weights or LossWeights()
-        self.student = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4).to(device)
-        self.teacher = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4).to(device)
+        self.student = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4)
+        self.teacher = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4)
+
+        if torch.cuda.device_count() > 1:
+            print(f"🔥 Detected {torch.cuda.device_count()} GPUs! Activating DataParallel.")
+            self.student = nn.DataParallel(self.student)
+            self.teacher = nn.DataParallel(self.teacher)
+
+        self.student = self.student.to(device)
+        self.teacher = self.teacher.to(device)
+
+        if concept_bank is not None:
+            self.bank_l1 = concept_bank[:2].to(device)
+            self.bank_l2 = concept_bank[2:].to(device)
+        else:
+            self.bank_l1 = None
+            self.bank_l2 = None
+
         self.teacher.load_state_dict(self.student.state_dict())
         for p in self.teacher.parameters():
             p.requires_grad = False
-
-        self.bank_l1 = concept_bank[:2].to(device) if concept_bank is not None else None
-        self.bank_l2 = concept_bank[2:].to(device) if concept_bank is not None else None
 
     def update(self, batch, optimizer, has_masks):
         images, masks, labels = [x.to(self.device) for x in batch]

@@ -2,6 +2,7 @@ import argparse
 import os
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
+from collections import defaultdict
 
 from algorithms_hc import HCMTLGGDRNetTrainer, LossWeights
 from dataset.medical_dataset import DomainConfig, MedicalDataset
@@ -11,145 +12,139 @@ class RobustCurriculumScheduler:
     def __init__(self, weights: LossWeights, total_epochs: int):
         self.weights = weights
         self.total_epochs = total_epochs
-
-        # 自动计算阶段边界 (基于 30% - 40% - 30% 的黄金比例)
-        self.phase1_end = int(total_epochs * 0.3)  # 约第 15 Epoch
-        self.phase2_end = int(total_epochs * 0.7)  # 约第 35 Epoch
+        self.phase1_end = int(total_epochs * 0.3)
+        self.phase2_end = int(total_epochs * 0.7)
 
     def step(self, epoch: int):
         if epoch < self.phase1_end:
-            # === Phase 1: 视觉热身 (Vision Warm-up) ===
-            # 策略: 哪怕天塌下来，也先把分割搞定。
-            # 权重: Seg=10 (绝对主导), Distill=1 (辅助)
             self.weights.seg = 10.0
             self.weights.distill = 1.0
-
-            # 关闭干扰项
             self.weights.concept = 0.0
             self.weights.ib = 0.0
             self.weights.cls = 0.0
             self.weights.reg = 0.0
-
             return "Phase 1: Vision Warm-up (Seg Focus)"
-
         elif epoch < self.phase2_end:
-            # === Phase 2: 语义对齐 (Semantic Alignment) ===
-            # 策略: 视觉好了，现在强迫 Projector 去对齐 BioMedCLIP。
-            # 权重: Concept=5 (拉大，让MLP快速收敛), IB=0.1 (去噪)
-            self.weights.seg = 1.0      # 降低 Seg 权重，维持即可
-            self.weights.distill = 1.0
-
-            self.weights.concept = 5.0  # 核心任务
-            self.weights.ib = 0.1
-
-            # 依然不诊断
-            self.weights.cls = 0.0
-            self.weights.reg = 0.0
-
-            return "Phase 2: Semantic Alignment (CLIP Focus)"
-
-        else:
-            # === Phase 3: 全局微调 (Global Fine-tuning) ===
-            # 策略: 特征和概念都好了，现在开分类头，并加上逻辑锁。
-            # 权重: Cls=1 (主任务), Reg=1 (逻辑约束)
             self.weights.seg = 1.0
             self.weights.distill = 1.0
-            self.weights.concept = 1.0  # 恢复正常
-            self.weights.ib = 0.1
-
-            self.weights.cls = 1.0      # 终于开始看病了
-            self.weights.reg = 1.0      # KCCL 逻辑锁开启
-
+            self.weights.concept = 5.0
+            self.weights.ib = 0.0
+            self.weights.cls = 0.0
+            self.weights.reg = 0.0
+            return "Phase 2: Semantic Alignment (CLIP Focus)"
+        else:
+            self.weights.seg = 1.0
+            self.weights.distill = 1.0
+            self.weights.concept = 1.0
+            self.weights.ib = 0.01
+            self.weights.cls = 1.0
+            self.weights.reg = 1.0
             return "Phase 3: Final Logic Tuning (Diagnosis)"
 
 
-def build_domains(root: str, names: list, has_masks: bool) -> list:
-    return [DomainConfig(name=name, root=os.path.join(root, name), has_masks=has_masks) for name in names]
-
-
 def main():
-    parser = argparse.ArgumentParser(description="HC-MT-LG-GDRNet One-Shot Training")
-    parser.add_argument("--data_root", type=str, default="./data", help="数据根目录")
-    parser.add_argument("--source_domains", nargs="+", required=True, help="源域数据集列表")
-    parser.add_argument("--target_domains", nargs="+", required=True, help="目标域数据集列表(仅测试用)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--source_domains", nargs="+", required=True)
+    parser.add_argument("--target_domains", nargs="+", required=True)
+    parser.add_argument("--concept_bank", type=str, default="concepts.pth")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=50, help="建议设置为 50 以保证课程完整")
-    parser.add_argument("--concept_bank", type=str, default="./concepts.pth")
-    # 注意：这里不再需要 lambda 参数了，Scheduler 全权接管
+    parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
 
-    # 1. 加载 BioMedCLIP 概念库
-    concept_bank = None
-    if os.path.exists(args.concept_bank):
-        concept_bank = torch.load(args.concept_bank, map_location="cpu")
-        print(f"[Init] Loaded concept bank: {concept_bank.shape}")
-    else:
-        print("[Warning] Concept bank not found! Language guidance will be disabled.")
+    # 1. 配置设备
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"🔥 Using device: {device}")
 
-    # 2. 初始化权重对象 (初始值不重要，Scheduler 会覆盖)
+    # 2. 准备数据集配置
+    source_domains = [DomainConfig(name=name, root=os.path.join(args.data_root, name), has_masks=True) for name in args.source_domains]
+    target_domains = [DomainConfig(name=name, root=os.path.join(args.data_root, name), has_masks=False) for name in args.target_domains]
+
+    # 3. 加载 Concept Bank
+    print(f"[Init] Loading concept bank from {args.concept_bank}")
+    # weights_only=True 防止新版 pytorch 警告
+    concept_bank = torch.load(args.concept_bank, map_location=device, weights_only=True)
+
+    # 4. 初始化训练器
     weights = LossWeights()
+    trainer = HCMTLGGDRNetTrainer(concept_bank=concept_bank, device=device, weights=weights)
 
-    # 3. 初始化 Trainer
-    trainer = HCMTLGGDRNetTrainer(concept_bank=concept_bank, weights=weights)
+    # 优化器
+    optimizer = torch.optim.AdamW(trainer.student.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    # 4. 准备数据
+    # 5. DataLoader 准备
+    # Source (Train)
     print(f"[Init] Loading Source Domains: {args.source_domains}")
-    source_domains = build_domains(args.data_root, args.source_domains, has_masks=True)
     source_datasets = [MedicalDataset(domain, augment=True) for domain in source_domains]
-    # 这里的 num_workers 设置为 4 或 8 以加速数据读取
-    source_loader = DataLoader(
-        ConcatDataset(source_datasets),
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-    )
+    source_dataset = ConcatDataset(source_datasets)
+    source_loader = DataLoader(source_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    # 5. 优化器 (使用较小的 lr 保证微调稳定)
-    optimizer = torch.optim.Adam(trainer.student.parameters(), lr=1e-4)
+    # Target (Validation) - 验证集不增强
+    print(f"[Init] Loading Target Domains (Validation): {args.target_domains}")
+    target_loaders = {}
+    for domain in target_domains:
+        val_ds = MedicalDataset(domain, augment=False)
+        target_loaders[domain.name] = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    # ==========================================
-    # [关键] 启动自动调度器
-    # ==========================================
     scheduler = RobustCurriculumScheduler(trainer.weights, total_epochs=args.epochs)
+    best_kappa = -1.0
 
-    # 6. 开始训练
     print("\n>>> Start Training with Robust Curriculum Schedule <<<")
+
     for epoch in range(args.epochs):
-        # 这一步会自动修改 trainer.weights 中的数值
         phase_name = scheduler.step(epoch)
-
         print(f"\n=== Epoch {epoch + 1}/{args.epochs} | {phase_name} ===")
-        # 打印当前权重给用户看，以此为证
-        print(
-            f"    [Weights] Seg={weights.seg:.1f} | Concept={weights.concept:.1f} | "
-            f"Cls={weights.cls:.1f} | Reg={weights.reg:.1f}"
-        )
 
-        epoch_loss = 0.0
+        # 定义累加器，用于统计所有 Loss
+        epoch_metrics = defaultdict(float)
         steps = 0
 
-        # 训练一个 Epoch
+        # --- Training Loop ---
         for batch in source_loader:
-            metrics = trainer.update(batch, optimizer, has_masks=True)
-            epoch_loss += metrics["loss"]
+            # update 返回的是一个包含所有 loss 分项的字典
+            step_metrics = trainer.update(batch, optimizer, has_masks=True)
+
+            # 累加所有指标
+            for k, v in step_metrics.items():
+                epoch_metrics[k] += v
             steps += 1
 
+            # 简单的进度展示
             if steps % 50 == 0:
-                print(
-                    f"    Step {steps:03d}: Loss={metrics['loss']:.4f} "
-                    f"(Seg={metrics['seg']:.4f}, Concept={metrics['concept']:.4f})"
-                )
+                print(f"    Step {steps:03d}: Loss={step_metrics['loss']:.4f}", end="\r")
 
-        print(f"    >>> Epoch {epoch + 1} Avg Loss: {epoch_loss / steps:.4f}")
+        # --- Epoch Summary (打印所有 Loss) ---
+        print(f"\n    >>> Epoch {epoch + 1} Summary:")
+        log_str = "    "
+        for k, v in epoch_metrics.items():
+            avg_val = v / steps
+            log_str += f"{k}={avg_val:.4f} | "
+        print(log_str)
 
-        # 保存模型 (建议只保存 Phase 3 的模型)
-        if epoch >= scheduler.phase2_end:
-            save_path = f"checkpoints/hc_gdrnet_epoch_{epoch+1}.pth"
-            os.makedirs("checkpoints", exist_ok=True)
-            torch.save(trainer.student.state_dict(), save_path)
-            print(f"    [Save] Model saved to {save_path}")
+        # --- Validation Loop (每 5 Epoch) ---
+        if (epoch + 1) % 5 == 0:
+            print(f"\n    --- Validation (Classification) ---")
+            total_kappa = 0
 
+            for name, loader in target_loaders.items():
+                val_res = trainer.validate(loader)
+                print(f"    [{name}] Acc: {val_res['Accuracy']:.4f} | Kappa: {val_res['Kappa']:.4f}")
+                total_kappa += val_res['Kappa']
+
+            avg_kappa = total_kappa / len(target_loaders)
+            print(f"    >>> Avg Kappa: {avg_kappa:.4f}")
+
+            # 保存最佳模型 (Phase 3 之后才开始算最佳，因为 Phase 1/2 分类头没训练)
+            if epoch > scheduler.phase2_end and avg_kappa > best_kappa:
+                best_kappa = avg_kappa
+                save_path = f"checkpoints/best_kappa_{best_kappa:.4f}.pth"
+                torch.save(trainer.student.state_dict(), save_path)
+                print(f"    [Save] 🌟 New Best Model saved to {save_path}")
+
+        # 定期保存 Checkpoint
+        if (epoch + 1) % 5 == 0:
+             torch.save(trainer.student.state_dict(), f"checkpoints/epoch_{epoch+1}.pth")
 
 if __name__ == "__main__":
     main()

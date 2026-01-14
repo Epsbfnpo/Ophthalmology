@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python -m new.main_hc \
-  --algorithm HC_MT_LG_GDRNet \
-  --data_root ./data \
-  --source_domains IDRiD DDR FGADR \
+python main_hc.py \
+  --data_root . \
+  --source_domains IDRID_processed DDR_processed FGADR_processed \
   --target_domains APTOS MESSIDOR \
-  --lambda_seg 10.0 \
-  --lambda_reg 1.0
+  --epochs 50 \
+  --batch_size 8 \
+  --concept_bank concepts.pth

@@ -93,5 +93,6 @@ class MedicalDataset(Dataset):
 
         image = TF.to_tensor(image)
         mask = TF.to_tensor(mask)
+        mask = (mask > 0).float()
         label = torch.tensor(self.labels[image_name], dtype=torch.long)
         return image, mask, label

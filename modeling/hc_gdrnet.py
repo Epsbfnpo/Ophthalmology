@@ -16,13 +16,14 @@ class ResNetBackbone(nn.Module):
             weight_path = "resnet50.pth"
             if os.path.exists(weight_path):
                 print(f"[Backbone] Loading local weights from {weight_path}")
-                state_dict = torch.load(weight_path, map_location="cpu")
+                # [FIX]: 加上 weights_only=True 消除警告
+                state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
                 resnet.load_state_dict(state_dict)
             else:
-                raise FileNotFoundError(
-                    f"❌ Pretrained weights not found at {os.path.abspath(weight_path)}. "
-                    "Please run the download script on the login node first."
-                )
+                # 如果没有本地权重，尝试联网下载 (登录节点使用)
+                print("[Backbone] Local weights not found, trying to download...")
+                resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+
         self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
         self.layer1 = resnet.layer1
         self.layer2 = resnet.layer2
@@ -57,13 +58,14 @@ class UNetDecoder(nn.Module):
             nn.Conv2d(64, 32, 3, padding=1),
             nn.ReLU(),
             nn.Upsample(scale_factor=2),
+            nn.Conv2d(32, 1, 1),
         )
-        self.out = nn.Conv2d(32, 1, 1)
 
-    def forward(self, x: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
-        x = self.up(x)
-        x = self.out(x)
-        return F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+    def forward(self, x: torch.Tensor, target_size: Tuple[int, int]):
+        out = self.up(x)
+        if out.shape[-2:] != target_size:
+            out = F.interpolate(out, size=target_size, mode="bilinear", align_corners=False)
+        return out
 
 
 class HierarchicalProjector(nn.Module):
@@ -72,19 +74,23 @@ class HierarchicalProjector(nn.Module):
         self.proj_l1 = nn.Sequential(
             nn.Linear(in_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, num_l1),
+            nn.Linear(256, num_l1)
         )
-
         self.proj_l2 = nn.Sequential(
             nn.Linear(in_dim + num_l1, 256),
             nn.ReLU(),
-            nn.Linear(256, num_l2),
+            nn.Linear(256, num_l2)
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor):
+        # [ROBUST FIX]: 自动检测输入是否为 4D [B, C, H, W]，如果是则压扁
+        if x.dim() == 4:
+            x = x.mean(dim=(2, 3))
+
         z_l1 = self.proj_l1(x)
-        feat_combined = torch.cat([x, torch.sigmoid(z_l1)], dim=1)
-        z_l2 = self.proj_l2(feat_combined)
+        # L2 input depends on L1 output (Conditioning)
+        x_l2 = torch.cat([x, F.relu(z_l1)], dim=1)
+        z_l2 = self.proj_l2(x_l2)
         return z_l1, z_l2
 
 
@@ -119,11 +125,7 @@ class HCGDRNet(nn.Module):
         mask_small = F.interpolate(clean_mask, size=feat.shape[-2:], mode="nearest")
         gated_feat = feat * mask_small
 
-        pooled_feat = F.adaptive_avg_pool2d(gated_feat, 1).flatten(1)
-        vis_emb = self.feat_adapter(pooled_feat)
-        vis_emb = F.normalize(vis_emb, dim=1)
+        # 由于 Projector 现在自带鲁棒性，这里不改也没事，但 Projector 会自动处理 GAP
+        z_l1, z_l2 = self.projector(gated_feat)
 
-        z_l1, z_l2 = self.projector(pooled_feat)
-        logits = self.classifier(torch.sigmoid(z_l2))
-
-        return feat, pred_mask, z_l1, z_l2, logits, vis_emb
+        return z_l1, z_l2

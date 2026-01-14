@@ -42,7 +42,6 @@ class HCMTLGGDRNetTrainer:
         self.device = device
         self.weights = weights or LossWeights()
 
-        # 初始化模型
         self.student = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4)
         self.teacher = HCGDRNet(concept_bank=concept_bank, num_l1_concepts=2, num_l2_concepts=4)
 
@@ -77,25 +76,43 @@ class HCMTLGGDRNetTrainer:
         labels = labels.to(self.device)
 
         # 1. Student Forward
-        # DataParallel 会自动分发 images
-        s_feat = self.student.module.backbone(images) if isinstance(self.student, nn.DataParallel) else self.student.backbone(images)
-
-        # 调用 forward 的其余部分 (Decoder, Projector, Classifier)
-        # 这里为了灵活性，我们手动调用子模块。如果模型没被 DataParallel 包裹，就直接调；如果包裹了，调 .module
         model_core = self.student.module if isinstance(self.student, nn.DataParallel) else self.student
 
-        # A. Segmentation Path
+        s_feat = model_core.backbone(images)
         s_pred_mask = model_core.decoder(s_feat, target_size=images.shape[-2:])
 
-        # B. Gating Logic
         clean_mask = s_pred_mask.detach()
         clean_mask = torch.sigmoid(clean_mask)
         mask_small = F.interpolate(clean_mask, size=s_feat.shape[-2:], mode="nearest")
         gated_feat = s_feat * mask_small
 
-        # C. Concept Path
-        s_z_l1, s_z_l2 = model_core.projector(gated_feat)
-        s_vis_emb = model_core.feat_adapter(gated_feat.mean(dim=(2, 3)))
+        # [CRITICAL FIX]: 这里必须做 GAP (Global Average Pooling) 把 [B, C, H, W] 变成 [B, C]
+        s_pooled_feat = gated_feat.mean(dim=(2, 3))
+
+        # 喂给 Projector 和 Adapter
+        s_z_l1, s_z_l2 = model_core.projector(s_pooled_feat)
+        s_vis_emb = model_core.feat_adapter(s_pooled_feat)
+
+        s_pred_cls = model_core.classifier(s_z_l2)
+
+        # 2. Teacher Forward (EMA)
+        with torch.no_grad():
+            teacher_core = self.teacher.module if isinstance(self.teacher, nn.DataParallel) else self.teacher
+            t_feat = teacher_core.backbone(images)
+
+            t_pred_mask = teacher_core.decoder(t_feat, target_size=images.shape[-2:])
+            t_clean_mask = torch.sigmoid(t_pred_mask)
+            t_mask_small = F.interpolate(t_clean_mask, size=t_feat.shape[-2:], mode="nearest")
+            t_gated_feat = t_feat * t_mask_small
+
+            # [CRITICAL FIX]: Teacher 也要做 GAP
+            t_pooled_feat = t_gated_feat.mean(dim=(2, 3))
+            t_vis_emb = teacher_core.feat_adapter(t_pooled_feat)
+
+        # 3. Calculate Losses
+        loss_cls = F.cross_entropy(s_pred_cls, labels)
+        loss_seg = dice_loss(s_pred_mask, masks) if has_masks else torch.tensor(0.0, device=self.device)
+        loss_distill = F.mse_loss(s_vis_emb, t_vis_emb)
 
         # D. Classification Path
         s_pred_cls = model_core.classifier(s_z_l2)
@@ -119,7 +136,6 @@ class HCMTLGGDRNetTrainer:
 
         # Concept Loss (Alignment with CLIP)
         if self.bank_l1 is not None:
-            # Normalize embeddings before dot product (Cosine Similarity)
             s_vis_norm = F.normalize(s_vis_emb, dim=1)
             bank_l1_norm = F.normalize(self.bank_l1, dim=1)
             bank_l2_norm = F.normalize(self.bank_l2, dim=1)
@@ -127,7 +143,6 @@ class HCMTLGGDRNetTrainer:
             with torch.no_grad():
                 target_sim_l1 = s_vis_norm @ bank_l1_norm.T
                 target_sim_l2 = s_vis_norm @ bank_l2_norm.T
-                # Clip targets to [0,1] just in case
                 target_sim_l1 = target_sim_l1.clamp(0, 1)
                 target_sim_l2 = target_sim_l2.clamp(0, 1)
 
@@ -175,9 +190,6 @@ class HCMTLGGDRNetTrainer:
         }
 
     def validate(self, dataloader):
-        """
-        验证模式：只计算分类指标 (Acc, Kappa)
-        """
         self.student.eval()
         all_preds = []
         all_labels = []
@@ -186,11 +198,9 @@ class HCMTLGGDRNetTrainer:
 
         with torch.no_grad():
             for batch in dataloader:
-                # 忽略 Mask，只取 Image 和 Label
                 images, _, labels = batch
                 images = images.to(self.device)
 
-                # 手动 Forward (复用 Gating 逻辑)
                 feat = model_core.backbone(images)
                 pred_mask = model_core.decoder(feat, target_size=images.shape[-2:])
 
@@ -198,7 +208,10 @@ class HCMTLGGDRNetTrainer:
                 mask_small = F.interpolate(clean_mask, size=feat.shape[-2:], mode="nearest")
                 gated_feat = feat * mask_small
 
-                _, z_l2 = model_core.projector(gated_feat)
+                # [CRITICAL FIX]: Validation 时也要做 GAP
+                pooled_feat = gated_feat.mean(dim=(2, 3))
+
+                _, z_l2 = model_core.projector(pooled_feat)
                 pred_cls = model_core.classifier(z_l2)
 
                 preds = torch.argmax(pred_cls, dim=1)
@@ -208,7 +221,6 @@ class HCMTLGGDRNetTrainer:
 
         self.student.train()
 
-        # 计算指标
         acc = accuracy_score(all_labels, all_preds)
         kappa = cohen_kappa_score(all_labels, all_preds, weights='quadratic')
 

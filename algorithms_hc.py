@@ -13,11 +13,11 @@ from modeling.hc_gdrnet import HCGDRNet
 @dataclass
 class LossWeights:
     cls: float = 1.0
-    seg: float = 10.0
-    distill: float = 2.0
-    concept: float = 5.0
-    reg: float = 2.0
-    ib: float = 0.1
+    seg: float = 1.0
+    distill: float = 0.0
+    concept: float = 0.5
+    reg: float = 1.0
+    ib: float = 0.01
 
 
 def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -84,7 +84,7 @@ class HCMTLGGDRNetTrainer:
         clean_mask = s_pred_mask.detach()
         clean_mask = torch.sigmoid(clean_mask)
         mask_small = F.interpolate(clean_mask, size=s_feat.shape[-2:], mode="nearest")
-        gated_feat = s_feat * mask_small
+        gated_feat = s_feat + (s_feat * mask_small)
 
         # [CRITICAL FIX]: 这里必须做 GAP (Global Average Pooling) 把 [B, C, H, W] 变成 [B, C]
         s_pooled_feat = gated_feat.mean(dim=(2, 3))
@@ -95,44 +95,24 @@ class HCMTLGGDRNetTrainer:
 
         s_pred_cls = model_core.classifier(s_z_l2)
 
-        # 2. Teacher Forward (EMA)
-        with torch.no_grad():
-            teacher_core = self.teacher.module if isinstance(self.teacher, nn.DataParallel) else self.teacher
-            t_feat = teacher_core.backbone(images)
+        # 2. Teacher Forward (EMA) for distillation (optional)
+        loss_distill = torch.tensor(0.0, device=self.device)
+        if self.weights.distill > 0:
+            with torch.no_grad():
+                teacher_core = self.teacher.module if isinstance(self.teacher, nn.DataParallel) else self.teacher
+                t_feat = teacher_core.backbone(images)
 
-            t_pred_mask = teacher_core.decoder(t_feat, target_size=images.shape[-2:])
-            t_clean_mask = torch.sigmoid(t_pred_mask)
-            t_mask_small = F.interpolate(t_clean_mask, size=t_feat.shape[-2:], mode="nearest")
-            t_gated_feat = t_feat * t_mask_small
-
-            # [CRITICAL FIX]: Teacher 也要做 GAP
-            t_pooled_feat = t_gated_feat.mean(dim=(2, 3))
-            t_vis_emb = teacher_core.feat_adapter(t_pooled_feat)
-
-        # 3. Calculate Losses
-        loss_cls = F.cross_entropy(s_pred_cls, labels)
-        loss_seg = dice_loss(s_pred_mask, masks) if has_masks else torch.tensor(0.0, device=self.device)
-        loss_distill = F.mse_loss(s_vis_emb, t_vis_emb)
-
-        # D. Classification Path
-        s_pred_cls = model_core.classifier(s_z_l2)
-
-        # 2. Teacher Forward (EMA)
-        with torch.no_grad():
-            teacher_core = self.teacher.module if isinstance(self.teacher, nn.DataParallel) else self.teacher
-            t_feat = teacher_core.backbone(images)
-
-            # Teacher 也走一遍流程生成 vis_emb
-            t_pred_mask = teacher_core.decoder(t_feat, target_size=images.shape[-2:])
-            t_clean_mask = torch.sigmoid(t_pred_mask)
-            t_mask_small = F.interpolate(t_clean_mask, size=t_feat.shape[-2:], mode="nearest")
-            t_gated_feat = t_feat * t_mask_small
-            t_vis_emb = teacher_core.feat_adapter(t_gated_feat.mean(dim=(2, 3)))
+                # Teacher 也走一遍流程生成 vis_emb
+                t_pred_mask = teacher_core.decoder(t_feat, target_size=images.shape[-2:])
+                t_clean_mask = torch.sigmoid(t_pred_mask)
+                t_mask_small = F.interpolate(t_clean_mask, size=t_feat.shape[-2:], mode="nearest")
+                t_gated_feat = t_feat + (t_feat * t_mask_small)
+                t_vis_emb = teacher_core.feat_adapter(t_gated_feat.mean(dim=(2, 3)))
+            loss_distill = F.mse_loss(s_vis_emb, t_vis_emb)
 
         # 3. Calculate Losses
         loss_cls = F.cross_entropy(s_pred_cls, labels)
         loss_seg = dice_loss(s_pred_mask, masks) if has_masks else torch.tensor(0.0, device=self.device)
-        loss_distill = F.mse_loss(s_vis_emb, t_vis_emb)
 
         # Concept Loss (Alignment with CLIP)
         if self.bank_l1 is not None:
@@ -206,7 +186,7 @@ class HCMTLGGDRNetTrainer:
 
                 clean_mask = torch.sigmoid(pred_mask)
                 mask_small = F.interpolate(clean_mask, size=feat.shape[-2:], mode="nearest")
-                gated_feat = feat * mask_small
+                gated_feat = feat + (feat * mask_small)
 
                 # [CRITICAL FIX]: Validation 时也要做 GAP
                 pooled_feat = gated_feat.mean(dim=(2, 3))

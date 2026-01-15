@@ -12,34 +12,34 @@ class RobustCurriculumScheduler:
     def __init__(self, weights: LossWeights, total_epochs: int):
         self.weights = weights
         self.total_epochs = total_epochs
-        self.phase1_end = int(total_epochs * 0.3)
-        self.phase2_end = int(total_epochs * 0.7)
+        self.phase1_end = 5
+        self.phase2_end = 15
 
     def step(self, epoch: int):
         if epoch < self.phase1_end:
-            self.weights.seg = 10.0
-            self.weights.distill = 1.0
+            self.weights.seg = 5.0
+            self.weights.distill = 0.0
             self.weights.concept = 0.0
             self.weights.ib = 0.0
             self.weights.cls = 0.0
             self.weights.reg = 0.0
-            return "Phase 1: Vision Warm-up (Seg Focus)"
+            return "Phase 1: Vision Warm-up"
         elif epoch < self.phase2_end:
             self.weights.seg = 1.0
-            self.weights.distill = 1.0
-            self.weights.concept = 5.0
+            self.weights.distill = 0.0
+            self.weights.concept = 1.0
             self.weights.ib = 0.0
-            self.weights.cls = 0.0
+            self.weights.cls = 0.1
             self.weights.reg = 0.0
-            return "Phase 2: Semantic Alignment (CLIP Focus)"
+            return "Phase 2: Semantic Alignment"
         else:
             self.weights.seg = 1.0
-            self.weights.distill = 1.0
-            self.weights.concept = 1.0
+            self.weights.distill = 0.0
+            self.weights.concept = 0.5
             self.weights.ib = 0.01
             self.weights.cls = 1.0
             self.weights.reg = 1.0
-            return "Phase 3: Final Logic Tuning (Diagnosis)"
+            return "Phase 3: Final Logic Tuning"
 
 
 def main():

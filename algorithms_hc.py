@@ -67,6 +67,7 @@ class HCMTLGGDRNetTrainer:
         self.teacher.load_state_dict(self.student.state_dict())
         for p in self.teacher.parameters():
             p.requires_grad = False
+        self.global_step = 0
 
     def update(self, batch, optimizer, has_masks=True):
         self.student.train()
@@ -158,6 +159,30 @@ class HCMTLGGDRNetTrainer:
 
         update_ema(self.student, self.teacher)
 
+        self.global_step += 1
+        if self.global_step % 100 == 0:
+            print("\n" + "=" * 40)
+            print(f"🩺 [DIAGNOSIS @ Step {self.global_step}]")
+            mask_sig = torch.sigmoid(s_pred_mask)
+            print(
+                "   👀 Mask:"
+                f" Mean={mask_sig.mean().item():.4f},"
+                f" Max={mask_sig.max().item():.4f},"
+                f" Min={mask_sig.min().item():.4f}"
+            )
+            print(f"   🧠 Concepts (First Sample): {probs_l2[0].detach().cpu().numpy().round(3)}")
+            preds = torch.argmax(s_pred_cls, dim=1)
+            unique, counts = torch.unique(preds, return_counts=True)
+            dist_dict = dict(zip(unique.cpu().numpy(), counts.cpu().numpy()))
+            print(f"   🎯 Batch Preds: {preds.cpu().numpy()}")
+            print(f"   📊 Pred Dist: {dist_dict}")
+            true_unique, true_counts = torch.unique(labels, return_counts=True)
+            true_dist = dict(zip(true_unique.cpu().numpy(), true_counts.cpu().numpy()))
+            print(f"   🏷️ True Dist: {true_dist}")
+            gated_norm = gated_feat.norm(dim=(1, 2, 3)).mean().item()
+            print(f"   🧩 Gated Feat Norm: {gated_norm:.4f}")
+            print("=" * 40 + "\n")
+
         # Return comprehensive metrics dict
         return {
             "loss": total_loss.item(),
@@ -200,6 +225,9 @@ class HCMTLGGDRNetTrainer:
                 all_labels.extend(labels.numpy())
 
         self.student.train()
+
+        unique, counts = np.unique(all_preds, return_counts=True)
+        print(f"   🔎 [VAL PREDS]: {dict(zip(unique, counts))}")
 
         acc = accuracy_score(all_labels, all_preds)
         kappa = cohen_kappa_score(all_labels, all_preds, weights='quadratic')

@@ -1,3 +1,4 @@
+import os
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 
@@ -222,8 +223,17 @@ class ResNet(Backbone):
 
 
 def init_pretrained_weights(model, model_url):
-    pretrain_dict = model_zoo.load_url(model_url)
-    # pretrain_dict = torch.load(model_url)
+    filename = model_url.split('/')[-1]
+
+    local_path = os.path.join('pretrained', filename)
+
+    if os.path.exists(local_path):
+        print(f"Loading pretrained model from local path: {local_path}")
+        pretrain_dict = torch.load(local_path, map_location='cpu')
+    else:
+        print(f"Local file not found at {local_path}, trying to download from {model_url}")
+        pretrain_dict = model_zoo.load_url(model_url)
+
     model.load_state_dict(pretrain_dict, strict=False)
 
 

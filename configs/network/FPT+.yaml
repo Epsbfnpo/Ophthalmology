@@ -1,0 +1,12 @@
+num_prompts: 16
+side_reduction_ratio: 8
+prompt_reduction_ratio: 1
+prompt_norm: true
+prompt_proj: false
+layers_to_extract: 6-11
+token_ratio: 0.2
+token_imp: global
+side_input_size: 128
+
+# 关键修改：指向你的 DINOv3 权重文件夹
+pretrained_path: /datasets/work/hb-nhmrc-dhcp/work/liu275/FPT/checkpoints/dinov3_vitb16

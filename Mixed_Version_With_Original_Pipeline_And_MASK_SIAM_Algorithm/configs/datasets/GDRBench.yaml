@@ -1,0 +1,35 @@
+EPOCHS: 100
+LEARNING_RATE: 0.001
+BATCH_SIZE: 16
+WEIGHT_DECAY: 0.0005
+MOMENTUM: 0.9
+
+# [New] Global Params for MASK_SIAM
+FASTMOCO: 0.0      # Set to 1.0 to enable FastMoCo logic
+MASK_RATIO: 0.5
+BLOCK: 32
+
+GDRNET:
+  BETA: 0.5
+  TEMPERATURE: 0.1
+  SCALING_FACTOR: 4.0
+  MASKED: 1.0      # [New] Weight for Masked Loss
+
+TRANSFORM:
+  AUGPROB: 0.5
+  COLORJITTER_B: 1
+  COLORJITTER_C: 1
+  COLORJITTER_S: 1
+  COLORJITTER_H: 0.05
+  FREQ: False      # [New] Set to True to enable HFC/Frequency Augmentation
+
+FISHR:
+  NUM_GROUPS: 1
+  EMA: 0.95
+  PENALTY_ANNEAL_ITERS: 1500
+  LAMBDA: 1000.
+
+DRGEN:
+  N_CONVERGENCE: 3
+  N_TOLERANCE: 6
+  TOLERANCE_RATIO: 0.3

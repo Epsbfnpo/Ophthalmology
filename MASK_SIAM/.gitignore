@@ -1,0 +1,22 @@
+# === 屏蔽超级大文件夹 ===
+result/
+GDRBench/
+
+# === 屏蔽生成的输出结果 ===
+output/
+gradcam_heatmaps_output/
+vis/
+figures/
+samples/
+__pycache__/
+
+# === 屏蔽常见的模型权重文件 (以防万一) ===
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.nii
+*.nii.gz
+
+# === 系统文件 ===
+.DS_Store

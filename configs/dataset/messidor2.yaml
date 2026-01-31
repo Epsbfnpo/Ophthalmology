@@ -1,9 +1,0 @@
-name: messidor2
-data_path: /datasets/work/hb-nhmrc-dhcp/work/liu275/FPT/Messidor2_FPT_Ready
-preload_path: /datasets/work/hb-nhmrc-dhcp/work/liu275/FPT/Messidor2_Preload_Features
-save_path: ./runs/messidor2
-input_size: 512 # image resolution for the LPM
-num_classes: 5 # number of classes
-mean: 'auto' # 'auto' or a list of three numbers for RGB
-std: 'auto' # 'auto' or a list of three numbers for RGB
-learning_rate: 0.0002 # dataset-specific learning rate

@@ -417,6 +417,13 @@ class CASS_GDRNet(Algorithm):
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
         self.K = 1024
         proj_dim = 1024
+        self.predictor_cnn = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.optimizer.add_param_group({"params": self.predictor_cnn.parameters()})
         self.register_buffer("queue", torch.randn(self.K, proj_dim))
         self.queue = nn.functional.normalize(self.queue, dim=-1)
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))

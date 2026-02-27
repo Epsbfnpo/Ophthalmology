@@ -139,6 +139,8 @@ class GDRNetLoss_Integrated(nn.Module):
         self.beta = beta
         self.SupLoss = nn.CrossEntropyLoss(reduction='none')
         self.MSELoss = nn.MSELoss(reduction='none')
+        self.kl_weight = 0.5
+        self.feature_distill_weight = 0.5
 
     def multinomial_smoothing(self, probs, beta):
         return torch.pow(probs, beta)
@@ -166,6 +168,8 @@ class GDRNetLoss_Integrated(nn.Module):
         dcr_weight = self.get_dcr_weights(labels, domains)
         logits_cnn = output_dict['logits_cnn']
         logits_vit = output_dict['logits_vit']
+        proj_vit = output_dict['proj_vit']
+        pred_cnn = output_dict.get('pred_cnn', output_dict.get('proj_cnn'))
         loss_sup_vit = (self.SupLoss(logits_vit, labels) * dcr_weight).mean()
         alpha = 0.5
         temperature = 2.0
@@ -176,9 +180,13 @@ class GDRNetLoss_Integrated(nn.Module):
         log_student = F.log_softmax(logits_cnn / temperature, dim=1)
         loss_distill_raw = F.kl_div(log_student, target_probs, reduction='none').sum(dim=1) * (temperature ** 2)
         loss_distill_cnn = (loss_distill_raw * dcr_weight).mean()
+        feat_pred_norm = F.normalize(pred_cnn, dim=1)
+        feat_teacher_norm = F.normalize(proj_vit.detach(), dim=1)
+        feat_distill_raw = 1.0 - F.cosine_similarity(feat_pred_norm, feat_teacher_norm, dim=1)
+        loss_feat_distill = (feat_distill_raw * dcr_weight).mean()
         loss_sup_cnn = (self.SupLoss(logits_cnn, labels) * dcr_weight).mean()
-        loss_total = loss_sup_vit + 0.2 * loss_sup_cnn + 1.0 * loss_distill_cnn
-        loss_dict = {"loss": loss_total.item(), "sup_vit": loss_sup_vit.item(), "sup_cnn": loss_sup_cnn.item(), "distill_cnn": loss_distill_cnn.item()}
+        loss_total = loss_sup_vit + 0.2 * loss_sup_cnn + self.kl_weight * loss_distill_cnn + self.feature_distill_weight * loss_feat_distill
+        loss_dict = {"loss": loss_total.item(), "sup_vit": loss_sup_vit.item(), "sup_cnn": loss_sup_cnn.item(), "distill_cnn": loss_distill_cnn.item(), "distill_feat": loss_feat_distill.item()}
         return loss_total, loss_dict
 
     def update_alpha(self, epoch):

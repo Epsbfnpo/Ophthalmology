@@ -417,6 +417,13 @@ class CASS_GDRNet(Algorithm):
         self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
         self.K = 1024
         proj_dim = 1024
+        self.predictor_cnn = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.optimizer.add_param_group({"params": self.predictor_cnn.parameters()})
         self.register_buffer("queue", torch.randn(self.K, proj_dim))
         self.queue = nn.functional.normalize(self.queue, dim=-1)
         self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
@@ -536,7 +543,8 @@ class CASS_GDRNet(Algorithm):
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 res_clean = self.network(x_cnn=x_cnn_input, x_vit=x_vit_input)
-        res_clean_fp32 = {'proj_cnn': res_clean['proj_cnn'].float(), 'proj_vit': res_clean['proj_vit'].float(), 'logits_cnn': res_clean['logits_cnn'].float(), 'logits_vit': res_clean['logits_vit'].float()}
+        pred_cnn = self.predictor_cnn(res_clean['proj_cnn'].float())
+        res_clean_fp32 = {'proj_cnn': res_clean['proj_cnn'].float(), 'pred_cnn': pred_cnn.float(), 'proj_vit': res_clean['proj_vit'].float(), 'logits_cnn': res_clean['logits_cnn'].float(), 'logits_vit': res_clean['logits_vit'].float()}
         loss_main, loss_dict = self.criterion(res_clean_fp32, label, domain)
         self.scaler.scale(loss_main).backward()
         self.scaler.unscale_(self.optimizer)

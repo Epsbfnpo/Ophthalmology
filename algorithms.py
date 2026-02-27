@@ -543,7 +543,7 @@ class CASS_GDRNet(Algorithm):
         with get_sync_context():
             with torch.amp.autocast('cuda'):
                 res_clean = self.network(x_cnn=x_cnn_input, x_vit=x_vit_input)
-        pred_cnn = self.predictor_cnn(res_clean['proj_cnn'])
+        pred_cnn = self.predictor_cnn(res_clean['proj_cnn'].float())
         res_clean_fp32 = {'proj_cnn': res_clean['proj_cnn'].float(), 'pred_cnn': pred_cnn.float(), 'proj_vit': res_clean['proj_vit'].float(), 'logits_cnn': res_clean['logits_cnn'].float(), 'logits_vit': res_clean['logits_vit'].float()}
         loss_main, loss_dict = self.criterion(res_clean_fp32, label, domain)
         self.scaler.scale(loss_main).backward()

@@ -721,3 +721,74 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.global_avgpool(x)
         feat_cnn_final = torch.flatten(x, 1)
         return feat_cnn_final
+
+
+class DualTower_NoFusion_Net(nn.Module):
+    def __init__(self, cfg):
+        super(DualTower_NoFusion_Net, self).__init__()
+        self.cnn = resnet50(pretrained=True)
+        if hasattr(self.cnn, 'out_features'):
+            self.cnn_dim = self.cnn.out_features()
+        else:
+            self.cnn_dim = 2048
+
+        default_dinov3_path = "/datasets/work/hb-nhmrc-dhcp/work/liu275/DGDR/checkpoints/dinov3_vitb16"
+        dinov3_path = getattr(cfg.GDRNET, 'DINOV3_PATH', default_dinov3_path)
+        lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
+        lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
+        lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
+        self.vit = DINOv3Wrapper(local_path=dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+        self.vit_dim = self.vit.out_features
+
+        proj_dim = 1024
+        self.projector_cnn = nn.Sequential(
+            nn.Linear(self.cnn_dim, self.cnn_dim),
+            nn.BatchNorm1d(self.cnn_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.cnn_dim, proj_dim)
+        )
+        self.projector_vit = nn.Sequential(
+            nn.Linear(self.vit_dim, self.vit_dim),
+            nn.BatchNorm1d(self.vit_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.vit_dim, proj_dim)
+        )
+
+        self.classifier_cnn = nn.Linear(self.cnn_dim, cfg.DATASET.NUM_CLASSES)
+        self.classifier_vit = nn.Linear(self.vit_dim, cfg.DATASET.NUM_CLASSES)
+
+    def forward(self, x_cnn, x_vit=None):
+        res = {}
+        img_for_vit = x_cnn if x_vit is None else x_vit
+
+        vit_outputs = self.vit(img_for_vit)
+        feat_vit_final = vit_outputs.last_hidden_state[:, 0]
+
+        x = self.cnn.conv1(x_cnn)
+        x = self.cnn.bn1(x)
+        x = self.cnn.relu(x)
+        x = self.cnn.maxpool(x)
+        x = self.cnn.layer1(x)
+        x = self.cnn.layer2(x)
+        x = self.cnn.layer3(x)
+        x = self.cnn.layer4(x)
+        x = self.cnn.global_avgpool(x)
+        feat_cnn_final = torch.flatten(x, 1)
+
+        res['logits_cnn'] = self.classifier_cnn(feat_cnn_final)
+        res['proj_cnn'] = self.projector_cnn(feat_cnn_final)
+        res['logits_vit'] = self.classifier_vit(feat_vit_final)
+        res['proj_vit'] = self.projector_vit(feat_vit_final)
+        return res
+
+    def extract_cnn_feature(self, x_cnn, x_vit=None):
+        x = self.cnn.conv1(x_cnn)
+        x = self.cnn.bn1(x)
+        x = self.cnn.relu(x)
+        x = self.cnn.maxpool(x)
+        x = self.cnn.layer1(x)
+        x = self.cnn.layer2(x)
+        x = self.cnn.layer3(x)
+        x = self.cnn.layer4(x)
+        x = self.cnn.global_avgpool(x)
+        return torch.flatten(x, 1)

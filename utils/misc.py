@@ -6,7 +6,7 @@ from collections import Counter
 
 ALL_DATASETS=['APTOS','DEEPDR','FGADR','IDRID','MESSIDOR','RLDR']
 ESDG_DATASETS = ['APTOS','DEEPDR','FGADR','IDRID','MESSIDOR','RLDR','DDR','EYEPACS']
-ALL_METHODS = ['GDRNet', 'ERM', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
+ALL_METHODS = ['GDRNet', 'ERM', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet', 'Baseline_CNN', 'Baseline_CASS', 'Baseline_CASS_Fusion', 'Baseline_CASS_Fusion_RandomMask']
 
 def count_samples_per_class(targets, num_classes):
     counts = Counter()

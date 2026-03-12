@@ -8,7 +8,7 @@ import utils.misc as misc
 from utils.validate import algorithm_validate
 import modeling.model_manager as models
 from modeling.losses import DahLoss, GDRNetLoss_Integrated, SupConLoss
-from modeling.nets import LossValley, AveragedModel, DualTowerGDRNet
+from modeling.nets import LossValley, AveragedModel, DualTowerGDRNet, DualTower_NoFusion_Net
 from dataset.data_manager import get_post_FundusAug
 from modeling.resnet import resnet50
 from backpack import backpack, extend
@@ -18,7 +18,7 @@ import torch.distributed as dist
 import copy
 import contextlib
 
-ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet', 'Baseline_CNN']
+ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet', 'Baseline_CNN', 'Baseline_CASS']
 
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
@@ -782,3 +782,206 @@ class CASS_GDRNet(Algorithm):
             logging.info(f"✅ Model renewed from {filename}")
         else:
             logging.warning(f"⚠️ Could not find {filename}, skipping load.")
+
+
+
+class Baseline_CASS(Algorithm):
+    def __init__(self, num_classes, cfg):
+        super(Baseline_CASS, self).__init__(num_classes, cfg)
+        self.cfg = cfg
+        self.network = DualTower_NoFusion_Net(cfg)
+        self.momentum_network = copy.deepcopy(self.network)
+        for param in self.momentum_network.parameters():
+            param.requires_grad = False
+        self.m = 0.999
+
+        trainable_params = [p for p in self.network.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.Adam(trainable_params, lr=cfg.LEARNING_RATE, weight_decay=0.0001)
+
+        self.K = 1024
+        proj_dim = 1024
+        self.num_positive = getattr(cfg, 'POSITIVE', 4)
+        self.register_buffer("queue_cnn", torch.randn(self.K, proj_dim))
+        self.queue_cnn = nn.functional.normalize(self.queue_cnn, dim=-1)
+        self.register_buffer("queue_vit", torch.randn(self.K, proj_dim))
+        self.queue_vit = nn.functional.normalize(self.queue_vit, dim=-1)
+        self.register_buffer("queue_labels", -torch.ones(self.K, dtype=torch.long))
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+        self.split_num = 2
+        self.combs = 3
+        self.fundusAug = get_post_FundusAug(cfg)
+        self.criterion = GDRNetLoss_Integrated(training_domains=cfg.DATASET.SOURCE_DOMAINS, beta=cfg.GDRNET.BETA)
+        self.scaler = torch.cuda.amp.GradScaler()
+
+    def _local_split(self, x):
+        _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
+        cols = x.split(_side_indent[1], dim=3)
+        xs = []
+        for _x in cols:
+            xs += _x.split(_side_indent[0], dim=2)
+        return torch.cat(xs, dim=0)
+
+    @torch.no_grad()
+    def dequeue_and_enqueue(self, feat_cnn, feat_vit, labels):
+        feat_cnn = feat_cnn.float()
+        feat_vit = feat_vit.float()
+        batch_size = feat_cnn.shape[0]
+        ptr = int(self.queue_ptr)
+        replace_idx = torch.arange(ptr, ptr + batch_size).to(feat_cnn.device) % self.K
+        self.queue_cnn[replace_idx, :] = feat_cnn
+        self.queue_vit[replace_idx, :] = feat_vit
+        self.queue_labels[replace_idx] = labels
+        ptr = (ptr + batch_size) % self.K
+        self.queue_ptr[0] = ptr
+
+    @torch.no_grad()
+    def sample_target(self, current_features, labels, target_queue):
+        neighbor = []
+        for i, label in enumerate(labels):
+            pos = torch.where(self.queue_labels == label)[0]
+            if len(pos) != 0:
+                if self.num_positive > 0:
+                    weights = torch.ones_like(pos).float()
+                    choice = torch.multinomial(weights, self.num_positive, replacement=True)
+                    idx = pos[choice]
+                    neighbor.append(target_queue[idx].mean(0))
+                else:
+                    neighbor.append(target_queue[pos].mean(0))
+            else:
+                neighbor.append(current_features[i])
+        targets = torch.stack(neighbor, dim=0)
+        return F.normalize(targets, dim=-1)
+
+    def update(self, minibatch):
+        image, mask, label, domain = minibatch
+        self.optimizer.zero_grad()
+
+        if hasattr(self.network, 'module'):
+            network_inner = self.network.module
+            get_sync_context = self.network.no_sync
+            momentum_inner = self.momentum_network.module if hasattr(self.momentum_network, 'module') else self.momentum_network
+        else:
+            network_inner = self.network
+            get_sync_context = contextlib.nullcontext
+            momentum_inner = self.momentum_network
+
+        img_strong, mask_strong = self.fundusAug['post_aug1'](image.clone(), mask.clone())
+        img_strong = img_strong * mask_strong
+        img_strong = self.fundusAug['post_aug2'](img_strong).contiguous()
+
+        img_weak = image.clone() * mask
+        img_weak = self.fundusAug['post_aug2'](img_weak).contiguous()
+
+        x_split_cnn = self._local_split(img_strong).contiguous()
+        with get_sync_context():
+            with torch.amp.autocast('cuda'):
+                feat_split = network_inner.extract_cnn_feature(x_cnn=x_split_cnn)
+            feat_split = feat_split.float()
+            if len(feat_split.shape) > 2:
+                feat_split = feat_split.view(feat_split.size(0), -1)
+            chunk_size = image.size(0)
+            feat_splits_list = list(feat_split.split(chunk_size, dim=0))
+            feat_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(feat_splits_list, r=self.combs)))), dim=0)
+
+        with torch.amp.autocast('cuda'):
+            res_clean = self.network(x_cnn=img_strong, x_vit=img_strong)
+
+        res_clean_fp32 = {
+            'proj_cnn': res_clean['proj_cnn'].float(),
+            'proj_vit': res_clean['proj_vit'].float(),
+            'logits_cnn': res_clean['logits_cnn'].float(),
+            'logits_vit': res_clean['logits_vit'].float(),
+        }
+
+        with torch.no_grad():
+            with torch.amp.autocast('cuda'):
+                res_momentum = momentum_inner(x_cnn=img_weak, x_vit=img_weak)
+            momentum_proj_vit = F.normalize(res_momentum['proj_vit'].float(), dim=1)
+            momentum_proj_cnn = F.normalize(res_momentum['proj_cnn'].float(), dim=1)
+
+        loss_fastmoco = torch.tensor(0.0, device=image.device)
+        with get_sync_context():
+            with torch.amp.autocast('cuda'):
+                proj_mix = network_inner.projector_cnn(feat_orthmix)
+            proj_mix = proj_mix.float()
+            proj_mix_norm = F.normalize(proj_mix, dim=1)
+            num_mixs = proj_mix.shape[0] // chunk_size
+            target_proj_rep = momentum_proj_vit.repeat(num_mixs, 1).detach()
+            cos_sim_mix = (proj_mix_norm * target_proj_rep).sum(dim=1)
+            loss_fastmoco = (2.0 - 2.0 * cos_sim_mix).mean()
+
+        target_vit_for_cnn = self.sample_target(res_clean_fp32['proj_vit'].detach(), label, self.queue_vit)
+        target_cnn_for_vit = self.sample_target(res_clean_fp32['proj_cnn'].detach(), label, self.queue_cnn)
+        self.dequeue_and_enqueue(momentum_proj_cnn.detach(), momentum_proj_vit.detach(), label)
+
+        target_dict = {'target_vit': target_vit_for_cnn, 'target_cnn': target_cnn_for_vit}
+        loss_main, loss_dict, _ = self.criterion(res_clean_fp32, target_dict, label, domain)
+
+        total_loss = loss_main + 0.1 * loss_fastmoco
+
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        with torch.no_grad():
+            for param_q, param_k in zip(network_inner.parameters(), momentum_inner.parameters()):
+                param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+
+        loss_dict['fastmoco'] = loss_fastmoco.item()
+        loss_dict['loss'] = total_loss.item()
+        return loss_dict
+
+    def update_epoch(self, epoch):
+        self.epoch = epoch
+        if hasattr(self.criterion, 'update_alpha'):
+            self.criterion.update_alpha(epoch)
+        return epoch
+
+    def validate(self, val_loader, test_loader, writer):
+        self.eval_branch = 'cnn'
+        metrics_cnn_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_cnn')
+        metrics_cnn_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
+        val_auc_cnn = metrics_cnn_val['auc']
+        test_auc_cnn = metrics_cnn_test['auc']
+
+        self.eval_branch = 'vit'
+        metrics_vit_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_vit')
+        metrics_vit_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_vit')
+        val_auc_vit = metrics_vit_val['auc']
+        test_auc_vit = metrics_vit_test['auc']
+
+        if self.epoch == self.cfg.EPOCHS:
+            self.epoch += 1
+        if self.epoch > self.cfg.EPOCHS:
+            logging.info(f"[Baseline_CASS] Final CNN AUC: val={val_auc_cnn:.4f}, test={test_auc_cnn:.4f}")
+            logging.info(f"[Baseline_CASS] Final ViT AUC: val={val_auc_vit:.4f}, test={test_auc_vit:.4f}")
+        self.eval_branch = 'cnn'
+        return val_auc_cnn, test_auc_cnn
+
+    def predict(self, x):
+        return self.network(x_cnn=x, x_vit=x)
+
+    def save_model(self, log_path, source='best'):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            logging.info(f"Saving {source} model...")
+            state_dict = self.network.module.state_dict() if hasattr(self.network, 'module') else self.network.state_dict()
+            if source == 'cnn':
+                torch.save(state_dict, os.path.join(log_path, 'best_model_cnn.pth'))
+            elif source == 'vit':
+                torch.save(state_dict, os.path.join(log_path, 'best_model_vit.pth'))
+            else:
+                torch.save(state_dict, os.path.join(log_path, 'best_model.pth'))
+
+    def renew_model(self, log_path, source='best'):
+        filename = f'best_model_{source}.pth' if source in ['cnn', 'vit'] else 'best_model.pth'
+        net_path = os.path.join(log_path, filename)
+        if os.path.exists(net_path):
+            state_dict = torch.load(net_path, map_location='cpu')
+            if hasattr(self.network, 'module'):
+                self.network.module.load_state_dict(state_dict)
+            else:
+                self.network.load_state_dict(state_dict)

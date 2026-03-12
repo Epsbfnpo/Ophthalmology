@@ -18,7 +18,7 @@ class SquarePad:
         return F.pad(image, (p_left, p_top, p_right, p_bottom), 0, 'constant')
 
 def get_dataset(args, cfg):
-    if cfg.ALGORITHM not in ['GDRNet', 'CASS_GDRNet', 'Baseline_CASS']:
+    if cfg.ALGORITHM not in ['GDRNet', 'CASS_GDRNet', 'Baseline_CASS', 'Baseline_CASS_Fusion']:
         train_ts, test_ts, tra_fundus = get_transform(cfg)
     else:
         train_ts, test_ts, tra_fundus = get_pre_FundusAug(cfg)

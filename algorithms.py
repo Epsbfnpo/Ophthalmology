@@ -82,14 +82,18 @@ class ERM(Algorithm):
 
     def save_model(self, log_path, **kwargs):
         logging.info("Saving best model...")
-        torch.save(self.network.state_dict(), os.path.join(log_path, 'best_model.pth'))
-        torch.save(self.classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        torch.save(network.state_dict(), os.path.join(log_path, 'best_model.pth'))
+        torch.save(classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
 
     def renew_model(self, log_path, **kwargs):
         net_path = os.path.join(log_path, 'best_model.pth')
         classifier_path = os.path.join(log_path, 'best_classifier.pth')
-        self.network.load_state_dict(torch.load(net_path))
-        self.classifier.load_state_dict(torch.load(classifier_path))
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        network.load_state_dict(torch.load(net_path))
+        classifier.load_state_dict(torch.load(classifier_path))
 
     def predict(self, x):
         return self.classifier(self.network(x))
@@ -109,15 +113,16 @@ class Baseline_CNN(Algorithm):
         )
 
     def extract_features(self, x):
-        x = self.network.conv1(x)
-        x = self.network.bn1(x)
-        x = self.network.relu(x)
-        x = self.network.maxpool(x)
-        x = self.network.layer1(x)
-        x = self.network.layer2(x)
-        x = self.network.layer3(x)
-        x = self.network.layer4(x)
-        x = self.network.global_avgpool(x)
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        x = network.conv1(x)
+        x = network.bn1(x)
+        x = network.relu(x)
+        x = network.maxpool(x)
+        x = network.layer1(x)
+        x = network.layer2(x)
+        x = network.layer3(x)
+        x = network.layer4(x)
+        x = network.global_avgpool(x)
         return torch.flatten(x, 1)
 
     def update(self, minibatch):
@@ -145,14 +150,18 @@ class Baseline_CNN(Algorithm):
 
     def save_model(self, log_path, **kwargs):
         logging.info("Saving best model...")
-        torch.save(self.network.state_dict(), os.path.join(log_path, 'best_model.pth'))
-        torch.save(self.classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        torch.save(network.state_dict(), os.path.join(log_path, 'best_model.pth'))
+        torch.save(classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
 
     def renew_model(self, log_path, **kwargs):
         net_path = os.path.join(log_path, 'best_model.pth')
         classifier_path = os.path.join(log_path, 'best_classifier.pth')
-        self.network.load_state_dict(torch.load(net_path))
-        self.classifier.load_state_dict(torch.load(classifier_path))
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        network.load_state_dict(torch.load(net_path))
+        classifier.load_state_dict(torch.load(classifier_path))
 
     def predict(self, x):
         features = self.extract_features(x)

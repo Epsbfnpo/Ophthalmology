@@ -10,6 +10,7 @@ import modeling.model_manager as models
 from modeling.losses import DahLoss, GDRNetLoss_Integrated, SupConLoss
 from modeling.nets import LossValley, AveragedModel, DualTowerGDRNet
 from dataset.data_manager import get_post_FundusAug
+from modeling.resnet import resnet50
 from backpack import backpack, extend
 from backpack.extensions import BatchGrad
 from itertools import combinations
@@ -17,7 +18,7 @@ import torch.distributed as dist
 import copy
 import contextlib
 
-ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet']
+ALGORITHMS = ['ERM', 'GDRNet', 'GREEN', 'CABNet', 'MixupNet', 'MixStyleNet', 'Fishr', 'DRGen', 'CASS_GDRNet', 'Baseline_CNN']
 
 def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
@@ -81,17 +82,90 @@ class ERM(Algorithm):
 
     def save_model(self, log_path, **kwargs):
         logging.info("Saving best model...")
-        torch.save(self.network.state_dict(), os.path.join(log_path, 'best_model.pth'))
-        torch.save(self.classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        torch.save(network.state_dict(), os.path.join(log_path, 'best_model.pth'))
+        torch.save(classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
 
     def renew_model(self, log_path, **kwargs):
         net_path = os.path.join(log_path, 'best_model.pth')
         classifier_path = os.path.join(log_path, 'best_classifier.pth')
-        self.network.load_state_dict(torch.load(net_path))
-        self.classifier.load_state_dict(torch.load(classifier_path))
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        network.load_state_dict(torch.load(net_path))
+        classifier.load_state_dict(torch.load(classifier_path))
 
     def predict(self, x):
         return self.classifier(self.network(x))
+
+
+class Baseline_CNN(Algorithm):
+    def __init__(self, num_classes, cfg):
+        super(Baseline_CNN, self).__init__(num_classes, cfg)
+        self.cfg = cfg
+        self.network = resnet50(pretrained=True)
+        self.out_dim = 2048
+        self.classifier = nn.Linear(self.out_dim, num_classes)
+        self.optimizer = torch.optim.Adam(
+            [{"params": self.network.parameters()}, {"params": self.classifier.parameters()}],
+            lr=cfg.LEARNING_RATE,
+            weight_decay=0.0001
+        )
+
+    def extract_features(self, x):
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        x = network.conv1(x)
+        x = network.bn1(x)
+        x = network.relu(x)
+        x = network.maxpool(x)
+        x = network.layer1(x)
+        x = network.layer2(x)
+        x = network.layer3(x)
+        x = network.layer4(x)
+        x = network.global_avgpool(x)
+        return torch.flatten(x, 1)
+
+    def update(self, minibatch):
+        image, mask, label, domain = minibatch
+        self.optimizer.zero_grad()
+        features = self.extract_features(image)
+        output = self.classifier(features)
+        loss = F.cross_entropy(output, label)
+        loss.backward()
+        self.optimizer.step()
+        return {'loss': loss.item()}
+
+    def validate(self, val_loader, test_loader, writer):
+        val_auc = -1
+        test_auc = -1
+        if self.epoch <= self.cfg.EPOCHS:
+            val_auc, val_loss = algorithm_validate(self, val_loader, writer, self.epoch, 'val')
+            test_auc, test_loss = algorithm_validate(self, test_loader, writer, self.epoch, 'test')
+            if self.epoch == self.cfg.EPOCHS:
+                self.epoch += 1
+        else:
+            test_auc, test_loss = algorithm_validate(self, test_loader, writer, self.cfg.EPOCHS + self.cfg.VAL_EPOCH, 'test')
+            logging.info('Best performance on test domain(s): {}'.format(test_auc))
+        return val_auc, test_auc
+
+    def save_model(self, log_path, **kwargs):
+        logging.info("Saving best model...")
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        torch.save(network.state_dict(), os.path.join(log_path, 'best_model.pth'))
+        torch.save(classifier.state_dict(), os.path.join(log_path, 'best_classifier.pth'))
+
+    def renew_model(self, log_path, **kwargs):
+        net_path = os.path.join(log_path, 'best_model.pth')
+        classifier_path = os.path.join(log_path, 'best_classifier.pth')
+        network = self.network.module if hasattr(self.network, 'module') else self.network
+        classifier = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+        network.load_state_dict(torch.load(net_path))
+        classifier.load_state_dict(torch.load(classifier_path))
+
+    def predict(self, x):
+        features = self.extract_features(x)
+        return self.classifier(features)
 
 
 class GDRNet(ERM):

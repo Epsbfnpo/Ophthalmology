@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 import logging
+import time
 from tqdm import tqdm
 import numpy as np
 
@@ -45,6 +46,8 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
         else:
             loader_bar = data_loader
         is_dual_stream = False
+        val_start_time = time.time()
+        local_val_samples = 0
         for batch in loader_bar:
             try:
                 if len(batch) == 5:
@@ -58,6 +61,7 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
             except IndexError as e:
                 print(f"[Rank {rank}] Error unpacking batch! Len: {len(batch)}")
                 raise e
+            local_val_samples += image.size(0)
             image = image.to(device)
             label = label.to(device).long()
             index = index.to(device).long()
@@ -93,6 +97,8 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
                 current_loss_display = batch_loss
             if rank == 0 and isinstance(loader_bar, tqdm):
                 loader_bar.set_postfix({'loss': f'{current_loss_display:.4f}'})
+        val_end_time = time.time()
+        time_per_img_val = (val_end_time - val_start_time) / local_val_samples * 1000 if local_val_samples > 0 else 0.0
         final_metrics = {}
         for stream_name, data in stream_data.items():
             if len(data['preds']) > 0:
@@ -139,9 +145,9 @@ def algorithm_validate(algorithm, data_loader, writer, epoch, val_type):
                 prefix = f"{val_type}"
                 if is_dual_stream:
                     prefix = f"{val_type}/{stream_name.upper()}"
-                    logging.info(f'[{stream_name.upper()}] {val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}')
+                    logging.info(f'[{stream_name.upper()}] {val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}, Time/Img: {time_per_img_val:.2f} ms/img (per GPU)')
                 else:
-                    logging.info(f'{val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}')
+                    logging.info(f'{val_type} - Epoch: {epoch}, Loss: {final_loss:.4f}, Acc: {acc:.4f}, AUC: {auc_ovo:.4f}, F1: {f1:.4f}, Time/Img: {time_per_img_val:.2f} ms/img (per GPU)')
                 if writer is not None:
                     writer.add_scalar(f'info/{prefix}_accuracy', acc, epoch)
                     writer.add_scalar(f'info/{prefix}_loss', final_loss, epoch)

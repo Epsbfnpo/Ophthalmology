@@ -121,7 +121,10 @@ def main():
             train_sampler.set_epoch(i)
         loss_avg = LossCounter()
         algorithm.train()
+        epoch_start_time = time.time()
+        total_train_samples = 0
         for image, mask, label, domain, img_index in train_loader:
+            total_train_samples += image.size(0)
             image = image.to(args.device)
             mask = mask.to(args.device)
             label = label.to(args.device).long()
@@ -129,6 +132,10 @@ def main():
             minibatch = [image, mask, label, domain]
             loss_dict_iter = algorithm.update(minibatch)
             loss_avg.update(loss_dict_iter['loss'])
+        epoch_end_time = time.time()
+        if args.local_rank in [-1, 0] and total_train_samples > 0:
+            time_per_img_train = (epoch_end_time - epoch_start_time) / total_train_samples * 1000
+            logging.info(f"Epoch {epoch} [Train] Time/Img: {time_per_img_train:.2f} ms/img (per GPU)")
         if hasattr(algorithm, 'update_epoch'):
             algorithm.update_epoch(epoch)
         if args.local_rank in [-1, 0]:

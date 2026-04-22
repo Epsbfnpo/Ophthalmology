@@ -840,6 +840,13 @@ class CASS_GDRNet(Algorithm):
 
         lambda_ortho = 1.5
 
+        # ===================================================================
+        # 🌟 终极方案：Student 自驱动残差注意力 + DDP 全局深度监督 + 动态分辨率防御
+        # ===================================================================
+
+        # ---------------------------------------------------------
+        # 1. DDP 防弹衣：对所有 16 个 LoASP 的 Mask 进行 TV 和 Sparsity 约束
+        # ---------------------------------------------------------
         loss_sparsity = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
         loss_tv = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
         mask_count = 0
@@ -848,6 +855,7 @@ class CASS_GDRNet(Algorithm):
             if m.__class__.__name__ == 'LoASP' and m.current_mask is not None:
                 mask_i = m.current_mask.float()
                 loss_sparsity += mask_i.mean()
+                # 计算 TV Loss (衡量边缘平滑度)
                 tv_h = torch.abs(mask_i[:, :, 1:, :] - mask_i[:, :, :-1, :]).mean()
                 tv_w = torch.abs(mask_i[:, :, :, 1:] - mask_i[:, :, :, :-1]).mean()
                 loss_tv += (tv_h + tv_w)
@@ -861,42 +869,58 @@ class CASS_GDRNet(Algorithm):
         lambda_sparse = 0.01
         loss_unsupervised_mask = lambda_tv * loss_tv + lambda_sparse * loss_sparsity
 
+        # ---------------------------------------------------------
+        # 2. 提取目标 Mask (从 layer4 提取，与 spatial_cnn 完美同源)
+        # ---------------------------------------------------------
         try:
-            teacher_loasp = momentum_inner.cnn.layer3[-1].loasp
+            student_loasp = network_inner.cnn.layer4[-1].loasp
         except AttributeError:
             try:
-                teacher_loasp = momentum_inner.cnn_backbone.layer3[-1].loasp
+                student_loasp = network_inner.cnn_backbone.layer4[-1].loasp
             except AttributeError:
-                teacher_loasp = momentum_inner.backbone.layer3[-1].loasp
+                student_loasp = network_inner.backbone.layer4[-1].loasp
 
-        M_teacher_weak = teacher_loasp.current_mask.detach().float() if teacher_loasp.current_mask is not None else None
-        if M_teacher_weak is None:
-            loss_mask_con = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        else:
+        student_mask = student_loasp.current_mask.float() if student_loasp.current_mask is not None else None
+
+        # ---------------------------------------------------------
+        # 3. 🚀 自驱动残差注意力 (Self-Driven Residual Attention)
+        # ---------------------------------------------------------
+        if student_mask is not None:
             F_student = res_clean_fp32['spatial_cnn']
-            B_s, C_s, H_s, W_s = F_student.shape
-            grid_feat = F.affine_grid(theta, [B_s, 1, H_s, W_s], align_corners=False)
-            M_teacher_aligned = F.grid_sample(
-                M_teacher_weak,
-                grid_feat,
-                mode='bilinear',
-                align_corners=False,
-                padding_mode='zeros'
-            )
-            threshold = 0.5
-            M_teacher_aligned_hard = (M_teacher_aligned >= threshold).float()
-            F_student_masked = F_student * M_teacher_aligned_hard
-            active_pixels = M_teacher_aligned_hard.sum(dim=[2, 3]) + 1e-6
-            z_masked = F_student_masked.sum(dim=[2, 3]) / active_pixels
+
+            # 【终极防线：动态分辨率对齐】防止不同层提取导致 Tensor Size Mismatch 崩溃
+            if student_mask.shape[-2:] != F_student.shape[-2:]:
+                student_mask = F.interpolate(
+                    student_mask,
+                    size=(F_student.size(2), F_student.size(3)),
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+            # 梯度贯通！对比学习直接驱动当前层的 Mask 去寻找病灶 (1.0 + M)
+            F_student_enhanced = F_student * (1.0 + student_mask)
+
+            # 标准的全图 GAP 均值池化，保证特征范数绝对健康，不再触发 Norm Collapse
+            z_enhanced = F_student_enhanced.mean(dim=[2, 3])
+
             if hasattr(network_inner, 'projector_cnn'):
-                z_masked = network_inner.projector_cnn(z_masked)
+                z_enhanced = network_inner.projector_cnn(z_enhanced)
 
-            z_masked_norm = F.normalize(z_masked, dim=-1)
+            z_enhanced_norm = F.normalize(z_enhanced, dim=-1)
+            # Teacher 的目标特征保持绝对静止，作为金标准
             z_target_norm = F.normalize(res_momentum['proj_cnn'].detach().float(), dim=-1)
-            loss_mask_con = (1.0 - (z_masked_norm * z_target_norm).sum(dim=-1)).mean()
 
+            # 对比损失：促使 (1+M) 提亮的区域是那些真正跨域不变的病理结构
+            loss_mask_con = (1.0 - (z_enhanced_norm * z_target_norm).sum(dim=-1)).mean()
+        else:
+            loss_mask_con = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+
+        # Warmup 控制：前 10 个 Epoch 先让 TV 和 Sparsity 约束生效，打好基础
         weight_mask_con = 0.0 if self.epoch < 10 else 1.0
 
+        # ---------------------------------------------------------
+        # 4. 补回 ViT 空间向导 (防止双塔系统脱节)
+        # ---------------------------------------------------------
         f_cnn_norm = F.normalize(res_clean_fp32['spatial_cnn'].detach(), p=2, dim=1)
         if res_clean_fp32.get('spatial_vit') is not None:
             f_vit_aligned = F.interpolate(
@@ -911,10 +935,19 @@ class CASS_GDRNet(Algorithm):
             loss_guide = (1.0 - F.cosine_similarity(f_vit_map, f_cnn_map, dim=1)).mean()
             weight_guide = 1.0
         else:
-            loss_guide = torch.tensor(0.0, device=device)
+            loss_guide = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
             weight_guide = 0.0
 
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + loss_unsupervised_mask + weight_mask_con * loss_mask_con + weight_guide * loss_guide
+        # ===================================================================
+        # 🎯 最终损失汇聚
+        # ===================================================================
+        total_loss = (loss_main
+                      + lambda_contrastive * loss_contrastive
+                      + 1.0 * loss_kd_total
+                      + lambda_ortho * loss_ortho
+                      + loss_unsupervised_mask
+                      + weight_mask_con * loss_mask_con
+                      + weight_guide * loss_guide)
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)

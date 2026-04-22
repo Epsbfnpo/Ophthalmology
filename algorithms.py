@@ -840,63 +840,71 @@ class CASS_GDRNet(Algorithm):
 
         lambda_ortho = 1.5
 
-        loss_sparsity = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        loss_tv = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        mask_count = 0
+        # ===================================================================
+        # 🌟 终极破局方案：跨模态自注意力蒸馏 (Cross-Modal Saliency Distillation)
+        # 彻底抛弃强制遮挡与 TV/Sparsity，改用 ViT 天然注意力作为金标准教导 CNN！
+        # ===================================================================
+        loss_mask_distill = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
-        for m in network_inner.modules():
-            if m.__class__.__name__ == 'LoASP' and m.current_mask is not None:
-                mask_i = m.current_mask.float()
-                loss_sparsity += mask_i.mean()
-                tv_h = torch.abs(mask_i[:, :, 1:, :] - mask_i[:, :, :-1, :]).mean()
-                tv_w = torch.abs(mask_i[:, :, :, 1:] - mask_i[:, :, :, :-1]).mean()
-                loss_tv += (tv_h + tv_w)
-                mask_count += 1
+        # 1. 从 Teacher (Momentum ViT) 获取天然的无监督显著性特征
+        vit_spatial = res_momentum.get('spatial_vit')
+        if vit_spatial is not None:
+            vit_spatial = vit_spatial.detach().float()
 
-        if mask_count > 0:
-            loss_sparsity = loss_sparsity / mask_count
-            loss_tv = loss_tv / mask_count
+            # 计算 ViT 特征的空间激活强度 (L2 Norm across channels) -> 天然热力图
+            vit_saliency = vit_spatial.norm(p=2, dim=1, keepdim=True)
 
-        lambda_tv = 0.05
-        lambda_sparse = 0.01
-        loss_unsupervised_mask = lambda_tv * loss_tv + lambda_sparse * loss_sparsity
+            # 实例级 Min-Max 归一化，得到 0~1 的伪掩码 (Pseudo-Mask)
+            B_v, _, H_v, W_v = vit_saliency.shape
+            vit_saliency_flat = vit_saliency.view(B_v, -1)
+            v_min = vit_saliency_flat.min(dim=1, keepdim=True)[0].unsqueeze(2).unsqueeze(3)
+            v_max = vit_saliency_flat.max(dim=1, keepdim=True)[0].unsqueeze(2).unsqueeze(3)
+            vit_pseudo_mask = (vit_saliency - v_min) / (v_max - v_min + 1e-8)
 
-        try:
-            teacher_loasp = momentum_inner.cnn.layer3[-1].loasp
-        except AttributeError:
-            try:
-                teacher_loasp = momentum_inner.cnn_backbone.layer3[-1].loasp
-            except AttributeError:
-                teacher_loasp = momentum_inner.backbone.layer3[-1].loasp
-
-        M_teacher_weak = teacher_loasp.current_mask.detach().float() if teacher_loasp.current_mask is not None else None
-        if M_teacher_weak is None:
-            loss_mask_con = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        else:
-            F_student = res_clean_fp32['spatial_cnn']
-            B_s, C_s, H_s, W_s = F_student.shape
-            grid_feat = F.affine_grid(theta, [B_s, 1, H_s, W_s], align_corners=False)
-            M_teacher_aligned = F.grid_sample(
-                M_teacher_weak,
+            # =======================================================
+            # 🚀 绝对核心：空间动态对齐 (Spatial Synchronization)
+            # Teacher ViT 处理的是未变形图，Student CNN 处理的是强变形图
+            # 必须用刚才生成 img_strong_cnn 的 theta 对伪掩码进行完全相同的扭曲！
+            # =======================================================
+            grid_feat = F.affine_grid(theta, [B_v, 1, H_v, W_v], align_corners=False)
+            vit_pseudo_mask_aligned = F.grid_sample(
+                vit_pseudo_mask,
                 grid_feat,
                 mode='bilinear',
                 align_corners=False,
                 padding_mode='zeros'
             )
-            threshold = 0.5
-            M_teacher_aligned_hard = (M_teacher_aligned >= threshold).float()
-            F_student_masked = F_student * M_teacher_aligned_hard
-            active_pixels = M_teacher_aligned_hard.sum(dim=[2, 3]) + 1e-6
-            z_masked = F_student_masked.sum(dim=[2, 3]) / active_pixels
-            if hasattr(network_inner, 'projector_cnn'):
-                z_masked = network_inner.projector_cnn(z_masked)
 
-            z_masked_norm = F.normalize(z_masked, dim=-1)
-            z_target_norm = F.normalize(res_momentum['proj_cnn'].detach().float(), dim=-1)
-            loss_mask_con = (1.0 - (z_masked_norm * z_target_norm).sum(dim=-1)).mean()
+            # 2. DDP 防弹衣 + 深度监督：教导 CNN 中所有的 LoASP 寻找病灶！
+            mask_count = 0
+            for m in network_inner.modules():
+                if m.__class__.__name__ == 'LoASP' and m.current_mask is not None:
+                    student_mask = m.current_mask.float()  # 这是 Sigmoid 输出，自带 0~1 范围
 
-        weight_mask_con = 0.0 if self.epoch < 10 else 1.0
+                    # 分辨率自适应：将 ViT 掩码平滑缩放到当前 CNN 层的分辨率
+                    if student_mask.shape[-2:] != vit_pseudo_mask_aligned.shape[-2:]:
+                        target_mask = F.interpolate(
+                            vit_pseudo_mask_aligned,
+                            size=(student_mask.size(2), student_mask.size(3)),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                    else:
+                        target_mask = vit_pseudo_mask_aligned
 
+                    # MSE 蒸馏损失：逼迫 CNN 的形变卷积去拟合 ViT 找出的高频结构！
+                    loss_mask_distill += F.mse_loss(student_mask, target_mask)
+                    mask_count += 1
+
+            if mask_count > 0:
+                loss_mask_distill = loss_mask_distill / mask_count
+
+        # 蒸馏权重（给大一点，因为 MSE 损失值绝对量级较小，通常在 0.05 左右）
+        lambda_mask_distill = 10.0
+
+        # ---------------------------------------------------------
+        # 3. 补回 ViT 空间向导 (CNN 向 ViT 学习空间结构后，再把局部精细对齐特征反馈给 ViT)
+        # ---------------------------------------------------------
         f_cnn_norm = F.normalize(res_clean_fp32['spatial_cnn'].detach(), p=2, dim=1)
         if res_clean_fp32.get('spatial_vit') is not None:
             f_vit_aligned = F.interpolate(
@@ -911,10 +919,18 @@ class CASS_GDRNet(Algorithm):
             loss_guide = (1.0 - F.cosine_similarity(f_vit_map, f_cnn_map, dim=1)).mean()
             weight_guide = 1.0
         else:
-            loss_guide = torch.tensor(0.0, device=device)
+            loss_guide = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
             weight_guide = 0.0
 
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + loss_unsupervised_mask + weight_mask_con * loss_mask_con + weight_guide * loss_guide
+        # ===================================================================
+        # 🎯 最终损失汇聚 (彻底除名了带来坍塌的 loss_tv, loss_sparsity 和 loss_mask_con)
+        # ===================================================================
+        total_loss = (loss_main
+                      + lambda_contrastive * loss_contrastive
+                      + 1.0 * loss_kd_total
+                      + lambda_ortho * loss_ortho
+                      + lambda_mask_distill * loss_mask_distill
+                      + weight_guide * loss_guide)
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -984,10 +1000,8 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
-        loss_dict['loss_tv'] = loss_tv.item()
-        loss_dict['loss_sparsity'] = loss_sparsity.item()
-        loss_dict['loss_mask_con'] = loss_mask_con.item()
-        loss_dict['weight_mask_con'] = weight_mask_con
+        loss_dict['loss_mask_distill'] = loss_mask_distill.item()
+        loss_dict['lambda_mask_distill'] = lambda_mask_distill
         loss_dict['loss_guide'] = loss_guide.item()
         loss_dict['weight_guide'] = weight_guide
         loss_dict['loss'] = total_loss.item()

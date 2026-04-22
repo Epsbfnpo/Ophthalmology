@@ -841,85 +841,69 @@ class CASS_GDRNet(Algorithm):
         lambda_ortho = 1.5
 
         # ===================================================================
-        # 🌟 终极方案：Student 自驱动残差注意力 + DDP 全局深度监督 + 动态分辨率防御
+        # 🌟 终极破局方案：跨模态自注意力蒸馏 (Cross-Modal Saliency Distillation)
+        # 彻底抛弃强制遮挡与 TV/Sparsity，改用 ViT 天然注意力作为金标准教导 CNN！
         # ===================================================================
+        loss_mask_distill = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
+
+        # 1. 从 Teacher (Momentum ViT) 获取天然的无监督显著性特征
+        vit_spatial = res_momentum.get('spatial_vit')
+        if vit_spatial is not None:
+            vit_spatial = vit_spatial.detach().float()
+
+            # 计算 ViT 特征的空间激活强度 (L2 Norm across channels) -> 天然热力图
+            vit_saliency = vit_spatial.norm(p=2, dim=1, keepdim=True)
+
+            # 实例级 Min-Max 归一化，得到 0~1 的伪掩码 (Pseudo-Mask)
+            B_v, _, H_v, W_v = vit_saliency.shape
+            vit_saliency_flat = vit_saliency.view(B_v, -1)
+            v_min = vit_saliency_flat.min(dim=1, keepdim=True)[0].unsqueeze(2).unsqueeze(3)
+            v_max = vit_saliency_flat.max(dim=1, keepdim=True)[0].unsqueeze(2).unsqueeze(3)
+            vit_pseudo_mask = (vit_saliency - v_min) / (v_max - v_min + 1e-8)
+
+            # =======================================================
+            # 🚀 绝对核心：空间动态对齐 (Spatial Synchronization)
+            # Teacher ViT 处理的是未变形图，Student CNN 处理的是强变形图
+            # 必须用刚才生成 img_strong_cnn 的 theta 对伪掩码进行完全相同的扭曲！
+            # =======================================================
+            grid_feat = F.affine_grid(theta, [B_v, 1, H_v, W_v], align_corners=False)
+            vit_pseudo_mask_aligned = F.grid_sample(
+                vit_pseudo_mask,
+                grid_feat,
+                mode='bilinear',
+                align_corners=False,
+                padding_mode='zeros'
+            )
+
+            # 2. DDP 防弹衣 + 深度监督：教导 CNN 中所有的 LoASP 寻找病灶！
+            mask_count = 0
+            for m in network_inner.modules():
+                if m.__class__.__name__ == 'LoASP' and m.current_mask is not None:
+                    student_mask = m.current_mask.float()  # 这是 Sigmoid 输出，自带 0~1 范围
+
+                    # 分辨率自适应：将 ViT 掩码平滑缩放到当前 CNN 层的分辨率
+                    if student_mask.shape[-2:] != vit_pseudo_mask_aligned.shape[-2:]:
+                        target_mask = F.interpolate(
+                            vit_pseudo_mask_aligned,
+                            size=(student_mask.size(2), student_mask.size(3)),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                    else:
+                        target_mask = vit_pseudo_mask_aligned
+
+                    # MSE 蒸馏损失：逼迫 CNN 的形变卷积去拟合 ViT 找出的高频结构！
+                    loss_mask_distill += F.mse_loss(student_mask, target_mask)
+                    mask_count += 1
+
+            if mask_count > 0:
+                loss_mask_distill = loss_mask_distill / mask_count
+
+        # 蒸馏权重（给大一点，因为 MSE 损失值绝对量级较小，通常在 0.05 左右）
+        lambda_mask_distill = 10.0
 
         # ---------------------------------------------------------
-        # 1. DDP 防弹衣：对所有 16 个 LoASP 的 Mask 进行 TV 和 Sparsity 约束
-        # ---------------------------------------------------------
-        loss_sparsity = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        loss_tv = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-        mask_count = 0
-
-        for m in network_inner.modules():
-            if m.__class__.__name__ == 'LoASP' and m.current_mask is not None:
-                mask_i = m.current_mask.float()
-                loss_sparsity += mask_i.mean()
-                # 计算 TV Loss (衡量边缘平滑度)
-                tv_h = torch.abs(mask_i[:, :, 1:, :] - mask_i[:, :, :-1, :]).mean()
-                tv_w = torch.abs(mask_i[:, :, :, 1:] - mask_i[:, :, :, :-1]).mean()
-                loss_tv += (tv_h + tv_w)
-                mask_count += 1
-
-        if mask_count > 0:
-            loss_sparsity = loss_sparsity / mask_count
-            loss_tv = loss_tv / mask_count
-
-        lambda_tv = 0.05
-        lambda_sparse = 0.01
-        loss_unsupervised_mask = lambda_tv * loss_tv + lambda_sparse * loss_sparsity
-
-        # ---------------------------------------------------------
-        # 2. 提取目标 Mask (从 layer4 提取，与 spatial_cnn 完美同源)
-        # ---------------------------------------------------------
-        try:
-            student_loasp = network_inner.cnn.layer4[-1].loasp
-        except AttributeError:
-            try:
-                student_loasp = network_inner.cnn_backbone.layer4[-1].loasp
-            except AttributeError:
-                student_loasp = network_inner.backbone.layer4[-1].loasp
-
-        student_mask = student_loasp.current_mask.float() if student_loasp.current_mask is not None else None
-
-        # ---------------------------------------------------------
-        # 3. 🚀 自驱动残差注意力 (Self-Driven Residual Attention)
-        # ---------------------------------------------------------
-        if student_mask is not None:
-            F_student = res_clean_fp32['spatial_cnn']
-
-            # 【终极防线：动态分辨率对齐】防止不同层提取导致 Tensor Size Mismatch 崩溃
-            if student_mask.shape[-2:] != F_student.shape[-2:]:
-                student_mask = F.interpolate(
-                    student_mask,
-                    size=(F_student.size(2), F_student.size(3)),
-                    mode='bilinear',
-                    align_corners=False
-                )
-
-            # 梯度贯通！对比学习直接驱动当前层的 Mask 去寻找病灶 (1.0 + M)
-            F_student_enhanced = F_student * (1.0 + student_mask)
-
-            # 标准的全图 GAP 均值池化，保证特征范数绝对健康，不再触发 Norm Collapse
-            z_enhanced = F_student_enhanced.mean(dim=[2, 3])
-
-            if hasattr(network_inner, 'projector_cnn'):
-                z_enhanced = network_inner.projector_cnn(z_enhanced)
-
-            z_enhanced_norm = F.normalize(z_enhanced, dim=-1)
-            # Teacher 的目标特征保持绝对静止，作为金标准
-            z_target_norm = F.normalize(res_momentum['proj_cnn'].detach().float(), dim=-1)
-
-            # 对比损失：促使 (1+M) 提亮的区域是那些真正跨域不变的病理结构
-            loss_mask_con = (1.0 - (z_enhanced_norm * z_target_norm).sum(dim=-1)).mean()
-        else:
-            loss_mask_con = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-
-        # Warmup 控制：前 10 个 Epoch 先让 TV 和 Sparsity 约束生效，打好基础
-        weight_mask_con = 0.0 if self.epoch < 10 else 1.0
-
-        # ---------------------------------------------------------
-        # 4. 补回 ViT 空间向导 (防止双塔系统脱节)
+        # 3. 补回 ViT 空间向导 (CNN 向 ViT 学习空间结构后，再把局部精细对齐特征反馈给 ViT)
         # ---------------------------------------------------------
         f_cnn_norm = F.normalize(res_clean_fp32['spatial_cnn'].detach(), p=2, dim=1)
         if res_clean_fp32.get('spatial_vit') is not None:
@@ -939,14 +923,13 @@ class CASS_GDRNet(Algorithm):
             weight_guide = 0.0
 
         # ===================================================================
-        # 🎯 最终损失汇聚
+        # 🎯 最终损失汇聚 (彻底除名了带来坍塌的 loss_tv, loss_sparsity 和 loss_mask_con)
         # ===================================================================
         total_loss = (loss_main
                       + lambda_contrastive * loss_contrastive
                       + 1.0 * loss_kd_total
                       + lambda_ortho * loss_ortho
-                      + loss_unsupervised_mask
-                      + weight_mask_con * loss_mask_con
+                      + lambda_mask_distill * loss_mask_distill
                       + weight_guide * loss_guide)
 
         with torch.no_grad():
@@ -1017,10 +1000,8 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
-        loss_dict['loss_tv'] = loss_tv.item()
-        loss_dict['loss_sparsity'] = loss_sparsity.item()
-        loss_dict['loss_mask_con'] = loss_mask_con.item()
-        loss_dict['weight_mask_con'] = weight_mask_con
+        loss_dict['loss_mask_distill'] = loss_mask_distill.item()
+        loss_dict['lambda_mask_distill'] = lambda_mask_distill
         loss_dict['loss_guide'] = loss_guide.item()
         loss_dict['weight_guide'] = weight_guide
         loss_dict['loss'] = total_loss.item()

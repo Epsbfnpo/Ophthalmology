@@ -440,12 +440,16 @@ class CASS_GDRNet(Algorithm):
             self.network.projector_cnn, self.network.projector_vit,
             self.network.predictor_cnn, self.network.predictor_vit,
             self.network.classifier_cnn, self.network.classifier_vit,
-            self.network.dual_stream_neck
+            self.network.dual_stream_neck,
+            self.network.feat_align_bottleneck,
+            self.network.masked_generation_block,
         ]
         head_params = []
         for module in head_modules:
             if module is not None:
                 head_params.extend([p for p in module.parameters() if p.requires_grad])
+        if hasattr(self.network, 'learnable_mask_token') and self.network.learnable_mask_token.requires_grad:
+            head_params.append(self.network.learnable_mask_token)
         self.head_params = head_params
         head_param_ids = {id(p) for p in self.head_params}
 
@@ -763,7 +767,7 @@ class CASS_GDRNet(Algorithm):
 
         # --- 1. 异构特征蒸馏 (HFD): ViT(Teacher) 引导 CNN(Student) ---
         # 步骤 A: 维度对齐 (2048 -> 768)
-        aligned_cnn = self.network.feat_align_bottleneck(spatial_cnn)
+        aligned_cnn = network_inner.feat_align_bottleneck(spatial_cnn)
 
         # 步骤 B: 空间分辨率对齐 (将 CNN 的 7x7 放大至 ViT 的 32x32)
         if aligned_cnn.shape[2:] != spatial_vit.shape[2:]:
@@ -775,8 +779,8 @@ class CASS_GDRNet(Algorithm):
         mask = (torch.rand(B, 1, H, W, device=aligned_cnn.device) < mask_ratio).float()
 
         # 步骤 D: 掩码替换与特征生成
-        masked_cnn = aligned_cnn * (1 - mask) + self.network.learnable_mask_token * mask
-        generated_cnn = self.network.masked_generation_block(masked_cnn)
+        masked_cnn = aligned_cnn * (1 - mask) + network_inner.learnable_mask_token * mask
+        generated_cnn = network_inner.masked_generation_block(masked_cnn)
 
         # 步骤 E: 仅针对 Mask 区域计算 MSE 损失
         mse_raw = F.mse_loss(generated_cnn, spatial_vit.detach(), reduction='none')

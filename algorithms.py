@@ -440,7 +440,7 @@ class CASS_GDRNet(Algorithm):
             self.network.projector_cnn, self.network.projector_vit,
             self.network.predictor_cnn, self.network.predictor_vit,
             self.network.classifier_cnn, self.network.classifier_vit,
-            self.network.dual_stream_neck
+            self.network.dual_stream_neck, self.network.side_generator
         ]
         head_params = []
         for module in head_modules:
@@ -681,6 +681,8 @@ class CASS_GDRNet(Algorithm):
             'logits_vit': res_combined['logits_vit'].float(),
             'tia_cls': res_combined['tia_cls'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
+            'spatial_cnn': res_combined['spatial_cnn'].float(),
+            'shallow_cnn': res_combined['shallow_cnn'].float(),
             'feat_vit': res_combined['feat_vit'].float(),
         }
 
@@ -694,6 +696,22 @@ class CASS_GDRNet(Algorithm):
                     return_train_features=True
                 )
             momentum_inner.train(momentum_prev_mode)
+
+        loss_hfd_shallow = F.mse_loss(
+            res_clean_fp32['shallow_cnn'],
+            res_momentum['shallow_cnn'].detach().float()
+        )
+        spatial_student = res_clean_fp32['spatial_cnn']
+        spatial_teacher = res_momentum['spatial_cnn'].detach().float()
+        B, C, H, W = spatial_student.shape
+        mask = (torch.rand(B, 1, H, W, device=spatial_student.device) > 0.5).float()
+        recon_feat = network_inner.side_generator(spatial_student * mask)
+        mask_inv = 1.0 - mask
+        loss_hfd_deep = (
+            F.mse_loss(recon_feat, spatial_teacher, reduction='none') * mask_inv
+        ).sum() / (mask_inv.sum() * C + 1e-8)
+        lambda_hfd = 10.0
+        loss_hfd = lambda_hfd * (loss_hfd_shallow + loss_hfd_deep)
 
         dcr_weight = self.criterion.get_dcr_weights(label, domain)
         loss_sup_cnn = (self.criterion.SupLoss(res_clean_fp32['logits_cnn'], label) * dcr_weight).mean()
@@ -810,7 +828,7 @@ class CASS_GDRNet(Algorithm):
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
         lambda_ortho = 1.5
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho + loss_hfd
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -877,6 +895,9 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
         loss_dict['loss_ortho'] = loss_ortho.item()
+        loss_dict['loss_hfd'] = loss_hfd.item()
+        loss_dict['loss_hfd_shallow'] = loss_hfd_shallow.item()
+        loss_dict['loss_hfd_deep'] = loss_hfd_deep.item()
         loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm

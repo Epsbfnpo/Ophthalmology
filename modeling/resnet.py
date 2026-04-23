@@ -1,7 +1,9 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.model_zoo as model_zoo
+import torchvision.ops as ops
 from configs.defaults import _C as cfg
 
 model_urls = {"resnet18": "https://download.pytorch.org/models/resnet18-5c106cde.pth", "resnet34": "https://download.pytorch.org/models/resnet34-333f7ec4.pth", "resnet50": "https://download.pytorch.org/models/resnet50-19c8e357.pth", "resnet101": "https://download.pytorch.org/models/resnet101-5d3b4d8f.pth", "resnet152": "https://download.pytorch.org/models/resnet152-b121ed2d.pth",}
@@ -78,6 +80,34 @@ class Bottleneck(nn.Module):
         out += residual
         out = self.relu(out)
         return out
+
+
+class LoASP(nn.Module):
+    def __init__(self, channels, rank=4):
+        super().__init__()
+        reduced_channels = max(1, channels // rank)
+        self.down_s = nn.Conv2d(channels, reduced_channels, kernel_size=1, bias=False)
+        self.offset_conv = nn.Conv2d(reduced_channels, 2 * 3 * 3, kernel_size=3, padding=1, bias=True)
+        self.deform_conv = ops.DeformConv2d(reduced_channels, reduced_channels, kernel_size=3, padding=1, bias=False)
+        self.bn_ds = nn.BatchNorm2d(reduced_channels)
+        self.splin_approx = nn.Conv2d(reduced_channels, channels, kernel_size=1, bias=False)
+        self.ac = nn.Sigmoid()
+        self._init_params()
+
+    def _init_params(self):
+        nn.init.constant_(self.offset_conv.weight, 0)
+        nn.init.constant_(self.offset_conv.bias, 0)
+        nn.init.constant_(self.splin_approx.weight, 0)
+
+    def forward(self, x):
+        identity = x
+        s_t = self.down_s(x)
+        offsets = self.offset_conv(s_t)
+        s_t_deform = self.deform_conv(s_t, offsets)
+        s_t = F.relu(self.bn_ds(s_t_deform))
+        s_t = self.splin_approx(s_t)
+        gate = self.ac(s_t)
+        return identity + gate * s_t
 
 
 class ResNet(Backbone):

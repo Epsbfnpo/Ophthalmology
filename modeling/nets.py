@@ -1,4 +1,4 @@
-from .resnet import resnet18, resnet50, resnet101
+from .resnet import LoASP, resnet18, resnet50, resnet101
 import torch
 import math
 import random
@@ -659,6 +659,18 @@ class RMLP_Projector(nn.Module):
 
         return x
 
+class LoASPMaskedGenerator(nn.Module):
+    def __init__(self, in_channels=2048, rank=4):
+        super().__init__()
+        self.loasp = LoASP(channels=in_channels, rank=rank)
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels)
+        )
+
+    def forward(self, x):
+        return self.proj(self.loasp(x))
+
 class DualTowerGDRNet(nn.Module):
     def __init__(self, cfg):
         super(DualTowerGDRNet, self).__init__()
@@ -735,6 +747,7 @@ class DualTowerGDRNet(nn.Module):
             bottleneck_dim=128,
             num_layers=4
         )
+        self.side_generator = LoASPMaskedGenerator(in_channels=self.cnn_dim, rank=4)
 
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit, self.dual_stream_neck]
@@ -758,7 +771,7 @@ class DualTowerGDRNet(nn.Module):
         if x_vit is None:
             x_vit = x_cnn
 
-        feat_cnn, spatial_cnn = self.extract_cnn_feature(x_cnn)
+        feat_cnn, spatial_cnn, shallow_cnn = self.extract_cnn_feature(x_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
 
         vit_outputs = self.vit(pixel_values=x_vit)
@@ -806,6 +819,7 @@ class DualTowerGDRNet(nn.Module):
             'tia_cls': tia_cls,
             'spatial_tokens': patch_tokens_vit,
             'spatial_cnn': spatial_cnn,
+            'shallow_cnn': shallow_cnn,
             'spatial_vit': spatial_vit,
         }
 
@@ -814,10 +828,10 @@ class DualTowerGDRNet(nn.Module):
         x = self.cnn.bn1(x)
         x = self.cnn.relu(x)
         x = self.cnn.maxpool(x)
-        x = self.cnn.layer1(x)
-        x = self.cnn.layer2(x)
-        x = self.cnn.layer3(x)
-        x_spatial = self.cnn.layer4(x)
+        layer1_feat = self.cnn.layer1(x)
+        x_shallow = self.cnn.layer2(layer1_feat)
+        x_mid = self.cnn.layer3(x_shallow)
+        x_spatial = self.cnn.layer4(x_mid)
         x_pooled = self.cnn.global_avgpool(x_spatial)
         feat_cnn_final = torch.flatten(x_pooled, 1)
-        return feat_cnn_final, x_spatial
+        return feat_cnn_final, x_spatial, x_shallow

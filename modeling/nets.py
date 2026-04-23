@@ -735,6 +735,19 @@ class DualTowerGDRNet(nn.Module):
             bottleneck_dim=128,
             num_layers=4
         )
+        self.feat_align_bottleneck = nn.Sequential(
+            nn.Conv2d(self.cnn_dim, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, self.vit_dim, kernel_size=1, bias=False)
+        )
+        self.masked_generation_block = nn.Sequential(
+            nn.Conv2d(self.vit_dim, self.vit_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.vit_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.vit_dim, self.vit_dim, kernel_size=3, padding=1, bias=False)
+        )
+        self.learnable_mask_token = nn.Parameter(torch.randn(1, self.vit_dim, 1, 1))
 
     def get_custom_optim_params(self):
         vit_modules = [self.vit, self.projector_vit, self.predictor_vit, self.classifier_vit, self.dual_stream_neck]
@@ -821,3 +834,8 @@ class DualTowerGDRNet(nn.Module):
         x_pooled = self.cnn.global_avgpool(x_spatial)
         feat_cnn_final = torch.flatten(x_pooled, 1)
         return feat_cnn_final, x_spatial
+
+    def deploy_cnn_inference(self, x_cnn):
+        feat_cnn, _ = self.extract_cnn_feature(x_cnn)
+        logits_cnn = self.classifier_cnn(feat_cnn)
+        return logits_cnn

@@ -440,12 +440,16 @@ class CASS_GDRNet(Algorithm):
             self.network.projector_cnn, self.network.projector_vit,
             self.network.predictor_cnn, self.network.predictor_vit,
             self.network.classifier_cnn, self.network.classifier_vit,
-            self.network.dual_stream_neck
+            self.network.dual_stream_neck,
+            self.network.feat_align_bottleneck,
+            self.network.masked_generation_block,
         ]
         head_params = []
         for module in head_modules:
             if module is not None:
                 head_params.extend([p for p in module.parameters() if p.requires_grad])
+        if hasattr(self.network, 'learnable_mask_token') and self.network.learnable_mask_token.requires_grad:
+            head_params.append(self.network.learnable_mask_token)
         self.head_params = head_params
         head_param_ids = {id(p) for p in self.head_params}
 
@@ -504,7 +508,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.cnn_train_transforms = v2.Compose([
-            v2.RandomResizedCrop(512, scale=(0.6, 1.0), antialias=True),
+            v2.RandomResizedCrop(224, scale=(0.6, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
             v2.RandomRotation(45),
@@ -522,7 +526,7 @@ class CASS_GDRNet(Algorithm):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         self.weak_transforms_cnn = v2.Compose([
-            v2.Resize((512, 512), antialias=True),
+            v2.Resize((224, 224), antialias=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
@@ -682,6 +686,8 @@ class CASS_GDRNet(Algorithm):
             'tia_cls': res_combined['tia_cls'].float(),
             'spatial_tokens': res_combined['spatial_tokens'].float(),
             'feat_vit': res_combined['feat_vit'].float(),
+            'spatial_cnn': res_combined['spatial_cnn'].float(),
+            'spatial_vit': res_combined['spatial_vit'].float(),
         }
 
         with torch.no_grad():
@@ -752,27 +758,49 @@ class CASS_GDRNet(Algorithm):
             'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
         })
 
-        # ==========================================
-        # 真正完美的双向互蒸馏 (Mutual KD)
-        # 1) KD 只做分布对齐，不再混入 true_dist，避免与 supervised CE 双重计算
-        # 2) 纯 KL + T^2 缩放，保证温度补偿的数学一致性
-        # ==========================================
+        # ===================================================================
+        # 🚀 [跨分辨率 MDPD 双轨蒸馏]
+        # CNN: 224x224 (7x7 Feature Map) <==> ViT: 512x512 (32x32 Feature Map)
+        # ===================================================================
+        spatial_cnn = res_clean_fp32['spatial_cnn']
+        spatial_vit = res_clean_fp32['spatial_vit']
+
+        # --- 1. 异构特征蒸馏 (HFD): ViT(Teacher) 引导 CNN(Student) ---
+        # 步骤 A: 维度对齐 (2048 -> 768)
+        aligned_cnn = network_inner.feat_align_bottleneck(spatial_cnn)
+
+        # 步骤 B: 空间分辨率对齐 (将 CNN 的 7x7 放大至 ViT 的 32x32)
+        if aligned_cnn.shape[2:] != spatial_vit.shape[2:]:
+            aligned_cnn = F.interpolate(aligned_cnn, size=spatial_vit.shape[2:], mode='bilinear', align_corners=False)
+
+        # 步骤 C: 生成随机掩码矩阵
+        B, C, H, W = aligned_cnn.shape
+        mask_ratio = 0.25
+        mask = (torch.rand(B, 1, H, W, device=aligned_cnn.device) < mask_ratio).float()
+
+        # 步骤 D: 掩码替换与特征生成
+        masked_cnn = aligned_cnn * (1 - mask) + network_inner.learnable_mask_token * mask
+        generated_cnn = network_inner.masked_generation_block(masked_cnn)
+
+        # 步骤 E: 仅针对 Mask 区域计算 MSE 损失
+        mse_raw = F.mse_loss(generated_cnn, spatial_vit.detach(), reduction='none')
+        loss_feature_kd = (mse_raw * mask).sum() / (mask.sum() * C + 1e-8)
+
+        # --- 2. 逻辑蒸馏 (Logits KD): 基于温度缩放的软标签 KL 散度 ---
         kd_temp = 2.0
-        kd_alpha = 0.5
-        label_smooth = 0.1
-        num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
-            vit_soft = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
             cnn_soft = F.softmax(res_momentum['logits_cnn'].detach() / kd_temp, dim=1)
+            vit_soft = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
 
+        # CNN(Student) 学习 ViT 的知识
         log_prob_cnn = F.log_softmax(res_clean_fp32['logits_cnn'] / kd_temp, dim=1)
-        loss_kd_cnn = F.kl_div(log_prob_cnn, vit_soft, reduction='batchmean') * (kd_temp ** 2)
+        loss_logits_kd_cnn = F.kl_div(log_prob_cnn, vit_soft, reduction='batchmean') * (kd_temp ** 2)
 
+        # ViT 同时学习 CNN 的局部敏感信息
         log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
-        loss_kd_vit = F.kl_div(log_prob_vit, cnn_soft, reduction='batchmean') * (kd_temp ** 2)
+        loss_logits_kd_vit = F.kl_div(log_prob_vit, cnn_soft, reduction='batchmean') * (kd_temp ** 2)
 
-        loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
-
+        # --- 3. 权重整合 ---
         warmup_epochs = self.warmup_epochs
         max_epochs = getattr(getattr(self.cfg, 'OPTIM', object()), 'MAX_EPOCH', self.max_epochs)
         current_epoch = self.epoch
@@ -783,7 +811,8 @@ class CASS_GDRNet(Algorithm):
             progress = min(1.0, max(0.0, (current_epoch - warmup_epochs) / denom))
             kd_weight = math.exp(-5.0 * (1.0 - progress) ** 2)
 
-        loss_kd_total = kd_weight * (loss_kd_cnn + loss_kd_vit)
+        loss_kd_total = kd_weight * (6e-5 * loss_feature_kd + 1.0 * (loss_logits_kd_cnn + loss_logits_kd_vit))
+        loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
         lambda_contrastive = 1.0
 
         # ===================================================================
@@ -911,8 +940,8 @@ class CASS_GDRNet(Algorithm):
             mask = mask.to(x.dtype)
 
         x_masked = x * mask
+        x_cnn = F.interpolate(x_masked, size=(224, 224), mode='bilinear', align_corners=False)
         x_vit = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
-        x_cnn = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
         return self.network(x_cnn=x_cnn, x_vit=x_vit)
 
     def save_model(self, log_path, source='best'):

@@ -742,21 +742,14 @@ class CASS_GDRNet(Algorithm):
         self.dequeue_and_enqueue(z_target_cnn_inst, z_target_vit_inst, label)
 
         loss_main = loss_sup
+        # 【修改1：精简对比损失监控，仅保留物理机制 1:1 绑定的项】
         loss_dict = {
-            'loss': loss_main.item(),
             'sup_cnn': loss_sup_cnn.item(),
             'sup_vit': loss_sup_vit.item(),
-            'loss_contrastive': loss_contrastive.item(),
-            'loss_instance': loss_instance.item(),
-            'loss_grade': loss_grade.item(),
+            'loss_instance': loss_instance.item(),  # 机制：实例级对齐
+            'loss_grade': loss_grade.item(),        # 机制：类别级聚类对齐
             'lambda_grade': lambda_grade,
         }
-        loss_dict.update({
-            'loss_inst_cnn2vit': loss_inst_cnn2vit.item(),
-            'loss_inst_vit2cnn': loss_inst_vit2cnn.item(),
-            'loss_grade_cnn2vit': loss_grade_cnn2vit.item(),
-            'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
-        })
 
         # ===================================================================
         # 🚀 [跨分辨率 MDPD 双轨蒸馏]
@@ -812,7 +805,6 @@ class CASS_GDRNet(Algorithm):
             kd_weight = math.exp(-5.0 * (1.0 - progress) ** 2)
 
         loss_kd_total = kd_weight * (6e-5 * loss_feature_kd + 1.0 * (loss_logits_kd_cnn + loss_logits_kd_vit))
-        loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
         lambda_contrastive = 1.0
 
         # ===================================================================
@@ -834,7 +826,6 @@ class CASS_GDRNet(Algorithm):
         # 4. 平方惩罚
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
-        probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
         probe_tia_norm = tia_cls.norm(dim=-1).mean().item()
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
@@ -842,22 +833,36 @@ class CASS_GDRNet(Algorithm):
         total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
 
         with torch.no_grad():
+            # 1. 获取准确率与预测丰富度 (补充核心基准)
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
-            pred_vit_classes = res_momentum['logits_vit'].argmax(dim=1)
+            pred_vit_classes = res_clean_fp32['logits_vit'].argmax(dim=1)  # 统一看 Student 状态
+
+            train_acc_cnn = (pred_cnn_classes == label).float().mean().item()
+            train_acc_vit = (pred_vit_classes == label).float().mean().item()
+
             unique_classes_cnn = len(torch.unique(pred_cnn_classes))
             unique_classes_vit = len(torch.unique(pred_vit_classes))
 
-            # 监控熵时使用真实温度 T=1.0，避免日志被蒸馏温度扭曲
+            # 2. 预测分布信息熵
             vit_probs_for_log = F.softmax(res_momentum['logits_vit'].detach(), dim=1)
             ema_vit_entropy = compute_entropy(vit_probs_for_log)
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
             cnn_entropy = compute_entropy(cnn_probs)
 
-            sim_inst_cnn = (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean().item()
-            sim_inst_vit = (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean().item()
-            sim_grade_cnn = (p_online_cnn * z_target_vit_grade).sum(dim=-1).mean().item()
-            sim_grade_vit = (p_online_vit * z_target_cnn_grade).sum(dim=-1).mean().item()
+            # 3. 类原型空间健康度 (补充：监控特征是否坍塌)
+            initialized_mask = self.class_proto_initialized
+            if initialized_mask.sum() > 1:
+                valid_protos = self.class_proto_cnn[initialized_mask]
+                sim_matrix = torch.mm(valid_protos, valid_protos.t())
+                # 获取上三角索引，不计算自身与自身的相似度(对角线)
+                triu_indices = torch.triu_indices(
+                    row=sim_matrix.size(0), col=sim_matrix.size(1), offset=1
+                )
+                proto_collapse_sim = sim_matrix[triu_indices[0], triu_indices[1]].mean().item()
+            else:
+                proto_collapse_sim = 0.0
 
+            # 4. 特征向量基础范数
             feat_norm_cnn_raw = res_combined['proj_cnn'].norm(dim=1).mean().item()
             feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()
 
@@ -888,27 +893,32 @@ class CASS_GDRNet(Algorithm):
                 else:
                     param_k.data.copy_(param_q.data)
 
-        loss_dict['loss_kd_cnn'] = loss_logits_kd_cnn.item() if kd_weight > 0 else 0.0
-        loss_dict['loss_kd_vit'] = loss_logits_kd_vit.item() if kd_weight > 0 else 0.0
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
+        # 【修改3：精简合并最终指标字典，严格1对1输出】
+        # === 蒸馏模块 ===
+        loss_dict['loss_kd_cnn'] = loss_logits_kd_cnn.item() if kd_weight > 0 else 0.0  # 机制：逻辑蒸馏 CNN<-ViT
+        loss_dict['loss_kd_vit'] = loss_logits_kd_vit.item() if kd_weight > 0 else 0.0  # 机制：逻辑蒸馏 ViT<-CNN
+        loss_dict['loss_feature_kd'] = loss_feature_kd.item() if kd_weight > 0 else 0.0  # 机制：异构特征空间生成蒸馏 (补齐)
         loss_dict['kd_weight'] = kd_weight
-        loss_dict['loss_at'] = loss_at.item()
+
+        # === 解耦模块 ===
+        loss_dict['loss_ortho'] = loss_ortho.item()  # 机制：TIA与TRA正交惩罚
+        loss_dict['probe_tia_norm'] = probe_tia_norm  # 探针：解耦流向特征强度
+        loss_dict['probe_spatial_norm'] = probe_spatial_norm
+
+        # === 网络健康状态与分类性能基准 ===
+        loss_dict['train_acc_cnn'] = train_acc_cnn  # 状态：CNN分类正确率
+        loss_dict['train_acc_vit'] = train_acc_vit  # 状态：ViT分类正确率
+        loss_dict['proto_collapse_sim'] = proto_collapse_sim  # 状态：类原型灾难缩聚监控
         loss_dict['probe_grad_backbone'] = grad_norm_backbone
         loss_dict['probe_grad_head'] = grad_norm_head
-        loss_dict['probe_sim_inst_cnn'] = sim_inst_cnn
-        loss_dict['probe_sim_inst_vit'] = sim_inst_vit
-        loss_dict['probe_sim_grade_cnn'] = sim_grade_cnn
-        loss_dict['probe_sim_grade_vit'] = sim_grade_vit
         loss_dict['probe_ent_ema_teacher'] = ema_vit_entropy
         loss_dict['probe_ent_cnn_student'] = cnn_entropy
         loss_dict['probe_unique_cls_cnn'] = unique_classes_cnn
         loss_dict['probe_unique_cls_vit'] = unique_classes_vit
         loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
         loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
-        loss_dict['loss_ortho'] = loss_ortho.item()
-        loss_dict['probe_ortho_sim'] = probe_ortho_sim
-        loss_dict['probe_tia_norm'] = probe_tia_norm
-        loss_dict['probe_spatial_norm'] = probe_spatial_norm
+
+        # === 核心总损失 ===
         loss_dict['loss'] = total_loss.item()
         return loss_dict
 

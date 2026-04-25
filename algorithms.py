@@ -504,7 +504,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.cnn_train_transforms = v2.Compose([
-            v2.RandomResizedCrop(1024, scale=(0.6, 1.0), antialias=True),
+            v2.RandomResizedCrop(1216, scale=(0.6, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
             v2.RandomRotation(45),
@@ -522,7 +522,7 @@ class CASS_GDRNet(Algorithm):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         self.weak_transforms_cnn = v2.Compose([
-            v2.Resize((1024, 1024), antialias=True),
+            v2.Resize((1216, 1216), antialias=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
@@ -899,8 +899,8 @@ class CASS_GDRNet(Algorithm):
                 mask = F.interpolate(mask, size=x.shape[-2:], mode='nearest')
 
         x_masked = x * mask
-        x_vit = F.interpolate(x_masked, size=(1024, 1024), mode='bilinear', align_corners=False)
-        x_cnn = F.interpolate(x_masked, size=(1024, 1024), mode='bilinear', align_corners=False)
+        x_vit = F.interpolate(x_masked, size=(1216, 1216), mode='bilinear', align_corners=False)
+        x_cnn = F.interpolate(x_masked, size=(1216, 1216), mode='bilinear', align_corners=False)
         return self.network(x_cnn=x_cnn, x_vit=x_vit)
 
     def save_model(self, log_path, source='best'):

@@ -654,6 +654,8 @@ class CASS_GDRNet(Algorithm):
         image_pixel = self._to_pixel_space(image.clone()).clamp(0.0, 1.0)
         bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
         mask_float = (mask > 0).to(image.dtype)
+        if mask_float.shape[-2:] != image_pixel.shape[-2:]:
+            mask_float = F.interpolate(mask_float, size=image_pixel.shape[-2:], mode='nearest')
 
         img_base_pixel = image_pixel * mask_float + bg_color * (1.0 - mask_float)
         img_weak_cnn = self.weak_transforms_cnn(img_base_pixel.clone()).contiguous()
@@ -893,6 +895,8 @@ class CASS_GDRNet(Algorithm):
             mask = torch.ones(x.shape[0], 1, x.shape[2], x.shape[3], dtype=x.dtype, device=x.device)
         else:
             mask = mask.to(x.dtype)
+            if mask.shape[-2:] != x.shape[-2:]:
+                mask = F.interpolate(mask, size=x.shape[-2:], mode='nearest')
 
         x_masked = x * mask
         x_vit = F.interpolate(x_masked, size=(1024, 1024), mode='bilinear', align_corners=False)

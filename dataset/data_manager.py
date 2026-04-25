@@ -37,7 +37,7 @@ def get_dataset(args, cfg):
     return train_loader, val_loader, test_loader, dataset_size, train_sampler
 
 def get_transform(cfg):
-    re_size = 512
+    re_size = 1024
     normalize = get_normalize()
     tra_train = v2.Compose([
         lambda img: square_tight_crop(img, target_size=re_size),
@@ -64,15 +64,15 @@ def get_pre_FundusAug(cfg):
     normalize = get_normalize()
 
     weak_transforms = v2.Compose([
-        lambda img: square_tight_crop(img, target_size=512),
-        v2.Resize((512, 512), antialias=True),
+        lambda img: square_tight_crop(img, target_size=1024),
+        v2.Resize((1024, 1024), antialias=True),
         v2.ToTensor(),
         normalize,
     ])
 
     vit_train_transforms = v2.Compose([
-        lambda img: square_tight_crop(img, target_size=512),
-        v2.Resize((512, 512), antialias=True),
+        lambda img: square_tight_crop(img, target_size=1024),
+        v2.Resize((1024, 1024), antialias=True),
         v2.RandomHorizontalFlip(p=0.5),
         v2.RandomVerticalFlip(p=0.5),
         v2.RandomRotation(45),
@@ -88,8 +88,8 @@ def get_pre_FundusAug(cfg):
 
 def get_post_FundusAug(cfg):
     aug_prob = getattr(cfg.TRANSFORM, 'AUGPROB', 0.5)
-    size = 512
-    re_size = 512
+    size = 1024
+    re_size = 1024
     normalize = get_normalize()
     tra_fundus_1 = FundusAug.Compose([FundusAug.Sharpness(prob=aug_prob), FundusAug.Halo(size, prob=aug_prob), FundusAug.Hole(size, prob=aug_prob), FundusAug.Spot(size, prob=aug_prob), FundusAug.Blur(prob=aug_prob)])
     tra_fundus_2 = transforms.Compose([transforms.RandomCrop(re_size), transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(), normalize])

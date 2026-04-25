@@ -504,7 +504,7 @@ class CASS_GDRNet(Algorithm):
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.cnn_train_transforms = v2.Compose([
-            v2.RandomResizedCrop(512, scale=(0.6, 1.0), antialias=True),
+            v2.RandomResizedCrop(1024, scale=(0.6, 1.0), antialias=True),
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
             v2.RandomRotation(45),
@@ -522,7 +522,7 @@ class CASS_GDRNet(Algorithm):
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         self.weak_transforms_cnn = v2.Compose([
-            v2.Resize((512, 512), antialias=True),
+            v2.Resize((1024, 1024), antialias=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
@@ -738,19 +738,15 @@ class CASS_GDRNet(Algorithm):
         loss_main = loss_sup
         loss_dict = {
             'loss': loss_main.item(),
+            'lr_backbone': self.optimizer.param_groups[0]['lr'],
+            'lr_head': self.optimizer.param_groups[1]['lr'],
             'sup_cnn': loss_sup_cnn.item(),
             'sup_vit': loss_sup_vit.item(),
-            'loss_contrastive': loss_contrastive.item(),
+            'dcr_weight_max': dcr_weight.max().item(),
             'loss_instance': loss_instance.item(),
             'loss_grade': loss_grade.item(),
             'lambda_grade': lambda_grade,
         }
-        loss_dict.update({
-            'loss_inst_cnn2vit': loss_inst_cnn2vit.item(),
-            'loss_inst_vit2cnn': loss_inst_vit2cnn.item(),
-            'loss_grade_cnn2vit': loss_grade_cnn2vit.item(),
-            'loss_grade_vit2cnn': loss_grade_vit2cnn.item(),
-        })
 
         # ==========================================
         # 真正完美的双向互蒸馏 (Mutual KD)
@@ -758,9 +754,6 @@ class CASS_GDRNet(Algorithm):
         # 2) 纯 KL + T^2 缩放，保证温度补偿的数学一致性
         # ==========================================
         kd_temp = 2.0
-        kd_alpha = 0.5
-        label_smooth = 0.1
-        num_classes = self.cfg.DATASET.NUM_CLASSES
         with torch.no_grad():
             vit_soft = F.softmax(res_momentum['logits_vit'].detach() / kd_temp, dim=1)
             cnn_soft = F.softmax(res_momentum['logits_cnn'].detach() / kd_temp, dim=1)
@@ -770,8 +763,6 @@ class CASS_GDRNet(Algorithm):
 
         log_prob_vit = F.log_softmax(res_clean_fp32['logits_vit'] / kd_temp, dim=1)
         loss_kd_vit = F.kl_div(log_prob_vit, cnn_soft, reduction='batchmean') * (kd_temp ** 2)
-
-        loss_at = torch.tensor(0.0, device=res_clean_fp32['logits_cnn'].device)
 
         warmup_epochs = self.warmup_epochs
         max_epochs = getattr(getattr(self.cfg, 'OPTIM', object()), 'MAX_EPOCH', self.max_epochs)
@@ -783,7 +774,6 @@ class CASS_GDRNet(Algorithm):
             progress = min(1.0, max(0.0, (current_epoch - warmup_epochs) / denom))
             kd_weight = math.exp(-5.0 * (1.0 - progress) ** 2)
 
-        loss_kd_total = kd_weight * (loss_kd_cnn + loss_kd_vit)
         lambda_contrastive = 1.0
 
         # ===================================================================
@@ -805,12 +795,11 @@ class CASS_GDRNet(Algorithm):
         # 4. 平方惩罚
         loss_ortho = torch.mean(cos_sim_ortho ** 2)
 
-        probe_ortho_sim = torch.abs(cos_sim_ortho).mean().item()
         probe_tia_norm = tia_cls.norm(dim=-1).mean().item()
         probe_spatial_norm = res_clean_fp32['spatial_tokens'].norm(dim=-1).mean().item()
 
         lambda_ortho = 1.5
-        total_loss = loss_main + lambda_contrastive * loss_contrastive + 1.0 * loss_kd_total + lambda_ortho * loss_ortho
+        total_loss = loss_main + lambda_contrastive * loss_contrastive + kd_weight * (loss_kd_cnn + loss_kd_vit) + lambda_ortho * loss_ortho
 
         with torch.no_grad():
             pred_cnn_classes = res_clean_fp32['logits_cnn'].argmax(dim=1)
@@ -823,14 +812,6 @@ class CASS_GDRNet(Algorithm):
             ema_vit_entropy = compute_entropy(vit_probs_for_log)
             cnn_probs = F.softmax(res_clean_fp32['logits_cnn'].detach(), dim=1)
             cnn_entropy = compute_entropy(cnn_probs)
-
-            sim_inst_cnn = (p_online_cnn * z_target_vit_inst).sum(dim=-1).mean().item()
-            sim_inst_vit = (p_online_vit * z_target_cnn_inst).sum(dim=-1).mean().item()
-            sim_grade_cnn = (p_online_cnn * z_target_vit_grade).sum(dim=-1).mean().item()
-            sim_grade_vit = (p_online_vit * z_target_cnn_grade).sum(dim=-1).mean().item()
-
-            feat_norm_cnn_raw = res_combined['proj_cnn'].norm(dim=1).mean().item()
-            feat_norm_vit_raw = res_combined['proj_vit'].norm(dim=1).mean().item()
 
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -861,26 +842,19 @@ class CASS_GDRNet(Algorithm):
 
         loss_dict['loss_kd_cnn'] = loss_kd_cnn.item() if kd_weight > 0 else 0.0
         loss_dict['loss_kd_vit'] = loss_kd_vit.item() if kd_weight > 0 else 0.0
-        loss_dict['loss_kd_total'] = loss_kd_total.item()
         loss_dict['kd_weight'] = kd_weight
-        loss_dict['loss_at'] = loss_at.item()
         loss_dict['probe_grad_backbone'] = grad_norm_backbone
         loss_dict['probe_grad_head'] = grad_norm_head
-        loss_dict['probe_sim_inst_cnn'] = sim_inst_cnn
-        loss_dict['probe_sim_inst_vit'] = sim_inst_vit
-        loss_dict['probe_sim_grade_cnn'] = sim_grade_cnn
-        loss_dict['probe_sim_grade_vit'] = sim_grade_vit
         loss_dict['probe_ent_ema_teacher'] = ema_vit_entropy
         loss_dict['probe_ent_cnn_student'] = cnn_entropy
         loss_dict['probe_unique_cls_cnn'] = unique_classes_cnn
         loss_dict['probe_unique_cls_vit'] = unique_classes_vit
-        loss_dict['probe_feat_norm_cnn_raw'] = feat_norm_cnn_raw
-        loss_dict['probe_feat_norm_vit_raw'] = feat_norm_vit_raw
         loss_dict['loss_ortho'] = loss_ortho.item()
-        loss_dict['probe_ortho_sim'] = probe_ortho_sim
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
         loss_dict['loss'] = total_loss.item()
+        if torch.cuda.is_available():
+            loss_dict['peak_vram_MB'] = torch.cuda.max_memory_allocated() / (1024 ** 2)
         return loss_dict
 
     def update_epoch(self, epoch):
@@ -893,6 +867,16 @@ class CASS_GDRNet(Algorithm):
             self.scheduler.step()
         if hasattr(self.criterion, 'update_alpha'):
             self.criterion.update_alpha(epoch)
+
+        if torch.cuda.is_available():
+            peak_alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            peak_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+            logging.info(
+                f"[Memory Monitor] Epoch {epoch} | "
+                f"Peak Allocated: {peak_alloc_mb:.0f} MB | "
+                f"Peak Reserved (nvidia-smi): {peak_reserved_mb:.0f} MB"
+            )
+            torch.cuda.reset_peak_memory_stats()
         return epoch
 
     def validate(self, val_loader, test_loader, writer):
@@ -911,8 +895,8 @@ class CASS_GDRNet(Algorithm):
             mask = mask.to(x.dtype)
 
         x_masked = x * mask
-        x_vit = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
-        x_cnn = F.interpolate(x_masked, size=(512, 512), mode='bilinear', align_corners=False)
+        x_vit = F.interpolate(x_masked, size=(1024, 1024), mode='bilinear', align_corners=False)
+        x_cnn = F.interpolate(x_masked, size=(1024, 1024), mode='bilinear', align_corners=False)
         return self.network(x_cnn=x_cnn, x_vit=x_vit)
 
     def save_model(self, log_path, source='best'):

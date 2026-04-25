@@ -853,6 +853,8 @@ class CASS_GDRNet(Algorithm):
         loss_dict['probe_tia_norm'] = probe_tia_norm
         loss_dict['probe_spatial_norm'] = probe_spatial_norm
         loss_dict['loss'] = total_loss.item()
+        if torch.cuda.is_available():
+            loss_dict['peak_vram_MB'] = torch.cuda.max_memory_allocated() / (1024 ** 2)
         return loss_dict
 
     def update_epoch(self, epoch):
@@ -865,6 +867,16 @@ class CASS_GDRNet(Algorithm):
             self.scheduler.step()
         if hasattr(self.criterion, 'update_alpha'):
             self.criterion.update_alpha(epoch)
+
+        if torch.cuda.is_available():
+            peak_alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            peak_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+            logging.info(
+                f"[Memory Monitor] Epoch {epoch} | "
+                f"Peak Allocated: {peak_alloc_mb:.0f} MB | "
+                f"Peak Reserved (nvidia-smi): {peak_reserved_mb:.0f} MB"
+            )
+            torch.cuda.reset_peak_memory_stats()
         return epoch
 
     def validate(self, val_loader, test_loader, writer):

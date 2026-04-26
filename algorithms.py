@@ -913,10 +913,12 @@ class CASS_GDRNet(Algorithm):
             if mask.shape[-2:] != x.shape[-2:]:
                 mask = F.interpolate(mask, size=x.shape[-2:], mode='nearest')
 
-        x_masked = x * mask
-        x_cnn = F.interpolate(x_masked, size=(224, 224), mode='bilinear', align_corners=False)
-        base_weak_img = F.interpolate(x_masked, size=(1216, 1216), mode='bilinear', align_corners=False)
-        x_vit_list = [resizer(base_weak_img).contiguous() for resizer in self.vit_resizers]
+        image_pixel = self._to_pixel_space(x.clone()).clamp(0.0, 1.0)
+        bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        img_clean = image_pixel * mask + bg_color * (1.0 - mask)
+
+        x_cnn = self.weak_transforms_cnn(img_clean).contiguous()
+        x_vit_list = [resizer(img_clean).contiguous() for resizer in self.vit_resizers]
         return self.network(x_cnn=x_cnn, x_vit_list=x_vit_list)
 
     def save_model(self, log_path, source='best'):

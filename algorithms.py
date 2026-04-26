@@ -897,11 +897,18 @@ class CASS_GDRNet(Algorithm):
         return epoch
 
     def validate(self, val_loader, test_loader, writer):
+        self.eval_branch = 'cnn'
         metrics_cnn_val, _ = algorithm_validate(self, val_loader, writer, self.epoch, 'val_cnn')
+        logging.info(f"🚀 [Epoch {self.epoch}] Running Fast Target Domain Test (CNN 224x224 only)...")
         metrics_cnn_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_cnn')
         val_auc_cnn = metrics_cnn_val['auc']
         test_auc_cnn = metrics_cnn_test['auc']
+
         if self.epoch == self.cfg.EPOCHS:
+            logging.info("🌟 [Final Epoch Reached] Starting Heavy Multi-Scale ViT Target Domain Test...")
+            self.eval_branch = 'both'
+            metrics_vit_test, _ = algorithm_validate(self, test_loader, writer, self.epoch, 'test_vit')
+            logging.info(f"✅ Final ViT Test AUC: {metrics_vit_test['auc']:.4f}")
             self.epoch += 1
         return val_auc_cnn, test_auc_cnn
 
@@ -918,6 +925,9 @@ class CASS_GDRNet(Algorithm):
         img_clean = image_pixel * mask + bg_color * (1.0 - mask)
 
         x_cnn = self.weak_transforms_cnn(img_clean).contiguous()
+        if getattr(self, 'eval_branch', 'cnn') == 'cnn':
+            return self.network(x_cnn=x_cnn, x_vit_list=None, cnn_only=True)
+
         x_vit_list = [resizer(img_clean).contiguous() for resizer in self.vit_resizers]
         return self.network(x_cnn=x_cnn, x_vit_list=x_vit_list)
 

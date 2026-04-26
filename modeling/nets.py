@@ -755,12 +755,15 @@ class DualTowerGDRNet(nn.Module):
 
         return cnn_params, vit_params
 
-    def forward(self, x_cnn, x_vit_list=None, return_train_features=False):
-        assert x_vit_list is not None and len(x_vit_list) == self.num_scales, \
-            f"x_vit_list 必须包含 {self.num_scales} 个分辨率的图像！当前接收了 {len(x_vit_list) if x_vit_list else 0} 个。"
-
+    def forward(self, x_cnn, x_vit_list=None, return_train_features=False, cnn_only=False):
         feat_cnn, spatial_cnn = self.extract_cnn_feature(x_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
+
+        if cnn_only:
+            return {'logits_cnn': logits_cnn, 'logits_vit': logits_cnn}
+
+        assert x_vit_list is not None and len(x_vit_list) == self.num_scales, \
+            f"x_vit_list 必须包含 {self.num_scales} 个分辨率的图像！当前接收了 {len(x_vit_list) if x_vit_list else 0} 个。"
 
         tra_cls_list = []
         tia_cls_list = []

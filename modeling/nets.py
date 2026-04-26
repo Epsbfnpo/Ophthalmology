@@ -669,15 +669,16 @@ class DualTowerGDRNet(nn.Module):
         lora_r = getattr(cfg.GDRNET, 'LORA_R', 8)
         lora_alpha = getattr(cfg.GDRNET, 'LORA_ALPHA', 16)
         lora_dropout = getattr(cfg.GDRNET, 'LORA_DROPOUT', 0.0)
-        use_grad_checkpointing = getattr(cfg.GDRNET, 'USE_VIT_GRAD_CHECKPOINTING', False)
+        use_grad_checkpointing = True
 
         self.vit = DINOv3Wrapper(local_path=default_dinov3_path, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, use_grad_checkpointing=use_grad_checkpointing)
         self.vit_dim = self.vit.out_features
         self.patch_size = getattr(self.vit.config, 'patch_size', 16)
+        self.num_scales = 3
 
         proj_dim = 1024
         pred_dim = 256
-        vit_combined_dim = self.vit_dim
+        vit_combined_dim = self.vit_dim * self.num_scales
         self.use_rmlp_vit = getattr(cfg.GDRNET, 'USE_RMLP_VIT', True)
         self.rmlp_amplitude = getattr(cfg.GDRNET, 'RMLP_AMPLITUDE', 0.1)
 
@@ -731,7 +732,7 @@ class DualTowerGDRNet(nn.Module):
         )
 
         self.dual_stream_neck = MultiLayerDualStreamNeck(
-            in_dim=vit_combined_dim,
+            in_dim=self.vit_dim,
             bottleneck_dim=128,
             num_layers=4
         )
@@ -754,41 +755,59 @@ class DualTowerGDRNet(nn.Module):
 
         return cnn_params, vit_params
 
-    def forward(self, x_cnn, x_vit=None, return_train_features=False):
-        if x_vit is None:
-            x_vit = x_cnn
+    def forward(self, x_cnn, x_vit_list=None, return_train_features=False):
+        if x_vit_list is None:
+            x_vit_list = [x_cnn]
 
         feat_cnn, spatial_cnn = self.extract_cnn_feature(x_cnn)
         logits_cnn = self.classifier_cnn(feat_cnn)
 
-        vit_outputs = self.vit(pixel_values=x_vit)
-        hidden_states = vit_outputs.hidden_states
+        tra_cls_list = []
+        tia_cls_list = []
+        spatial_tokens_list = []
 
-        tra_tokens, tia_tokens = self.dual_stream_neck(hidden_states)
+        target_H, target_W = x_vit_list[-1].shape[-2:]
+        target_grid_H = target_H // self.patch_size
+        target_grid_W = target_W // self.patch_size
+        num_register_tokens = getattr(self.vit.config, "num_register_tokens", 4)
+        patch_start = 1 + num_register_tokens
 
-        feat_vit = tra_tokens[:, 0]
-        feat_vit_combined = feat_vit
+        for x_vit in x_vit_list:
+            vit_outputs = self.vit(pixel_values=x_vit)
+            hidden_states = vit_outputs.hidden_states
+
+            tra_tokens, tia_tokens = self.dual_stream_neck(hidden_states)
+
+            tra_cls_list.append(tra_tokens[:, 0])
+            tia_cls_list.append(tia_tokens[:, 0])
+
+            B, N, D = tra_tokens.shape
+            num_patches = N - patch_start
+            patch_tokens_1d = tra_tokens[:, patch_start:patch_start + num_patches, :]
+
+            current_grid_H = int(math.sqrt(num_patches))
+            current_grid_W = num_patches // current_grid_H
+            spatial_2d = patch_tokens_1d.transpose(1, 2).contiguous().reshape(B, D, current_grid_H, current_grid_W)
+
+            if current_grid_H != target_grid_H or current_grid_W != target_grid_W:
+                spatial_2d = F.interpolate(
+                    spatial_2d,
+                    size=(target_grid_H, target_grid_W),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            spatial_tokens_list.append(spatial_2d)
+
+        feat_vit_combined = torch.cat(tra_cls_list, dim=-1)
+        tia_cls_combined = torch.cat(tia_cls_list, dim=-1)
+        spatial_vit_combined = torch.cat(spatial_tokens_list, dim=1)
+        B, D_multi, H_m, W_m = spatial_vit_combined.shape
+        patch_tokens_vit_combined = spatial_vit_combined.reshape(B, D_multi, H_m * W_m).transpose(1, 2).contiguous()
 
         logits_vit = self.classifier_vit(feat_vit_combined)
 
         if not return_train_features:
             return {'logits_cnn': logits_cnn, 'logits_vit': logits_vit}
-
-        tia_cls = tia_tokens[:, 0]
-
-        B_vit, C_vit, H_img, W_img = x_vit.shape
-        H_vit, W_vit = H_img // self.patch_size, W_img // self.patch_size
-        num_patches = H_vit * W_vit
-
-        num_register_tokens = getattr(self.vit.config, "num_register_tokens", 4)
-        patch_start = 1 + num_register_tokens
-
-        patch_tokens_vit = tra_tokens[:, patch_start : patch_start + num_patches, :]
-
-        B, N, D = patch_tokens_vit.shape
-        assert N == H_vit * W_vit, f"💥 Patch count mismatch! Expected {H_vit * W_vit}, got {N}."
-
-        spatial_vit = patch_tokens_vit.transpose(1, 2).reshape(B, D, H_vit, W_vit)
 
         proj_cnn = self.projector_cnn(feat_cnn)
         proj_vit = self.projector_vit(feat_vit_combined)
@@ -802,11 +821,11 @@ class DualTowerGDRNet(nn.Module):
             'proj_vit': proj_vit,
             'pred_cnn': pred_cnn,
             'pred_vit': pred_vit,
-            'feat_vit': feat_vit_combined if hasattr(self, 'rmlp_vit') else feat_vit,
-            'tia_cls': tia_cls,
-            'spatial_tokens': patch_tokens_vit,
+            'feat_vit': feat_vit_combined,
+            'tia_cls': tia_cls_combined,
+            'spatial_tokens': patch_tokens_vit_combined,
             'spatial_cnn': spatial_cnn,
-            'spatial_vit': spatial_vit,
+            'spatial_vit': spatial_vit_combined,
         }
 
     def extract_cnn_feature(self, x_cnn):

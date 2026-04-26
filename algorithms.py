@@ -511,21 +511,25 @@ class CASS_GDRNet(Algorithm):
             v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        self.vit_train_transforms = v2.Compose([
-            v2.Resize((1216, 1216), antialias=True),
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.RandomRotation(10),
-            v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        self.weak_transforms = v2.Compose([
-            v2.Resize((1216, 1216), antialias=True),
-            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
         self.weak_transforms_cnn = v2.Compose([
             v2.Resize((224, 224), antialias=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+
+        self.shared_strong_aug = v2.Compose([
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomRotation(10),
+            v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        ])
+
+        self.vit_scales = [(768, 768), (992, 992), (1216, 1216)]
+        self.vit_resizers = [
+            v2.Compose([
+                v2.Resize(scale, antialias=True),
+                v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]) for scale in self.vit_scales
+        ]
+        self.weak_transforms_multi = self.vit_resizers
 
     def _apply_batch_transform(self, images, transform):
         return torch.stack([transform(img) for img in images], dim=0)
@@ -667,8 +671,12 @@ class CASS_GDRNet(Algorithm):
         mask_1216 = F.interpolate(mask_float, size=(1216, 1216), mode='nearest')
         img_base_1216 = F.interpolate(image_pixel, size=(1216, 1216), mode='bilinear', align_corners=False)
         img_clean_1216 = img_base_1216 * mask_1216 + bg_color * (1.0 - mask_1216)
-        img_weak_vit = self.weak_transforms(img_clean_1216).contiguous()
-        img_strong_vit = self.vit_train_transforms(img_clean_1216).contiguous()
+
+        base_strong_img = self.shared_strong_aug(img_clean_1216)
+        base_weak_img = img_clean_1216
+
+        img_strong_vit_list = [resizer(base_strong_img).contiguous() for resizer in self.vit_resizers]
+        img_weak_vit_list = [resizer(base_weak_img).contiguous() for resizer in self.weak_transforms_multi]
 
         autocast_ctx = contextlib.nullcontext
         if torch.cuda.is_available():
@@ -677,7 +685,7 @@ class CASS_GDRNet(Algorithm):
         with autocast_ctx():
             res_combined = self.network(
                 x_cnn=img_strong_cnn,
-                x_vit=img_strong_vit,
+                x_vit_list=img_strong_vit_list,
                 return_train_features=True
             )
 
@@ -699,7 +707,7 @@ class CASS_GDRNet(Algorithm):
             with autocast_ctx():
                 res_momentum = momentum_inner(
                     x_cnn=img_weak_cnn,
-                    x_vit=img_weak_vit,
+                    x_vit_list=img_weak_vit_list,
                     return_train_features=True
                 )
             momentum_inner.train(momentum_prev_mode)
@@ -905,10 +913,13 @@ class CASS_GDRNet(Algorithm):
             if mask.shape[-2:] != x.shape[-2:]:
                 mask = F.interpolate(mask, size=x.shape[-2:], mode='nearest')
 
-        x_masked = x * mask
-        x_cnn = F.interpolate(x_masked, size=(224, 224), mode='bilinear', align_corners=False)
-        x_vit = F.interpolate(x_masked, size=(1216, 1216), mode='bilinear', align_corners=False)
-        return self.network(x_cnn=x_cnn, x_vit=x_vit)
+        image_pixel = self._to_pixel_space(x.clone()).clamp(0.0, 1.0)
+        bg_color = torch.tensor([0.5074, 0.2816, 0.1456], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        img_clean = image_pixel * mask + bg_color * (1.0 - mask)
+
+        x_cnn = self.weak_transforms_cnn(img_clean).contiguous()
+        x_vit_list = [resizer(img_clean).contiguous() for resizer in self.vit_resizers]
+        return self.network(x_cnn=x_cnn, x_vit_list=x_vit_list)
 
     def save_model(self, log_path, source='best'):
         rank = dist.get_rank() if dist.is_initialized() else 0

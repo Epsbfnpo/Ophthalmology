@@ -226,13 +226,9 @@ def main():
                 sys.exit(0)
     debug_log("Training Finished. Starting Final Testing...", args.local_rank)
 
-    # 终局测试：把测试模式切回 both，准备跑 ViT 多尺度
-    if hasattr(algorithm, 'eval_branch'):
-        algorithm.eval_branch = 'both'
-        if args.local_rank in [-1, 0]:
-            logging.info("🌟 [Final Testing] Fully utilizing CNN + MuRF ViT on Target Domains!")
+    # 安全防范：确保 is_dual_stream 不会因为 Python 变量作用域报错
+    is_dual_stream = ('val_metrics' in locals() and 'cnn_auc' in val_metrics) or hasattr(algorithm, 'eval_branch')
 
-    is_dual_stream = ('cnn_auc' in val_metrics and 'vit_auc' in val_metrics)
     if is_dual_stream:
         branches_to_test = ['cnn', 'vit']
         for branch in branches_to_test:
@@ -242,15 +238,31 @@ def main():
                 algorithm.renew_model(log_path, source=branch)
             except Exception as e:
                 pass
+
+            # 根据当前测试的 Best Model 动态切换极速/全量模式
+            if hasattr(algorithm, 'eval_branch'):
+                if branch == 'cnn':
+                    algorithm.eval_branch = 'cnn'
+                    if args.local_rank in [-1, 0]:
+                        logging.info("⚡️ [Final Testing] Fast evaluating CNN Best Model...")
+                else:
+                    algorithm.eval_branch = 'both'
+                    if args.local_rank in [-1, 0]:
+                        logging.info("🌟 [Final Testing] Fully utilizing MuRF ViT Best Model...")
+
             if is_distributed: dist.barrier()
+
             test_metrics, test_loss = algorithm_validate(algorithm, test_loader, writer, cfg.EPOCHS, 'test')
             target_auc = test_metrics.get(f'{branch}_auc', test_metrics.get('auc', 0.0))
             target_acc = test_metrics.get(f'{branch}_acc', test_metrics.get('acc', 0.0))
             target_f1 = test_metrics.get(f'{branch}_f1', test_metrics.get('f1', 0.0))
+
             if args.local_rank in [-1, 0]:
                 with open(os.path.join(log_path, f'done_{branch}'), 'w') as f:
-                    f.write(f'done, best_val={best_performance_cnn if branch == "cnn" else best_performance_vit:.4f}, test_auc={target_auc:.4f}, test_acc={target_acc:.4f}, test_f1={target_f1:.4f}')
+                    best_val_auc = best_performance_cnn if branch == "cnn" else best_performance_vit
+                    f.write(f'done, best_val={best_val_auc:.4f}, test_auc={target_auc:.4f}, test_acc={target_acc:.4f}, test_f1={target_f1:.4f}')
     else:
+        # 单分支网络 (如 ERM Baseline) 的传统测试逻辑，保持不变
         if args.local_rank in [-1, 0]:
             save_checkpoint(final_ckpt_path, algorithm, optimizer, scheduler, cfg.EPOCHS, best_performance)
         if is_distributed:
@@ -271,6 +283,7 @@ def main():
             with open(os.path.join(log_path, 'done'), 'w') as f:
                 f.write(f'done, best_val={best_performance:.4f}, test_auc={test_auc:.4f}, test_acc={test_acc:.4f}, test_f1={test_f1:.4f}')
         if writer: writer.close()
+
     if is_distributed:
         dist.barrier()
         dist.destroy_process_group()

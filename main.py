@@ -149,11 +149,25 @@ def main():
         if args.local_rank in [-1, 0]:
             save_checkpoint(latest_ckpt_path, algorithm, optimizer, scheduler, epoch, best_performance)
         if epoch % cfg.VAL_EPOCH == 0:
+            # 1. 验证阶段 (Source Domain) -> 全量模式 (CNN + ViT 都要跑)
+            if hasattr(algorithm, 'eval_branch'):
+                algorithm.eval_branch = 'both'
+
             if args.local_rank in [-1, 0]:
-                logging.info(f"Epoch {epoch} Validation...")
+                logging.info(f"Epoch {epoch} Validation (Source Domain: CNN + ViT)...")
 
             val_metrics, val_loss = algorithm_validate(algorithm, val_loader, writer, epoch, 'val')
             is_dual_stream = ('cnn_auc' in val_metrics and 'vit_auc' in val_metrics)
+
+            # 2. 测试阶段 (7个 Target Domains) -> 极速模式 (只跑 CNN)
+            if hasattr(algorithm, 'eval_branch'):
+                algorithm.eval_branch = 'cnn'
+
+            if args.local_rank in [-1, 0]:
+                logging.info(f"🚀 [Epoch {epoch}] Fast Target Test (7 Domains, CNN 224x224 Only)...")
+
+            # 这里专门跑测试，只在日志中打印，不会用来选 best model
+            test_metrics_cnn, test_loss_cnn = algorithm_validate(algorithm, test_loader, writer, epoch, 'test')
 
             if is_distributed:
                 dist.barrier()
@@ -211,6 +225,13 @@ def main():
                     dist.destroy_process_group()
                 sys.exit(0)
     debug_log("Training Finished. Starting Final Testing...", args.local_rank)
+
+    # 终局测试：把测试模式切回 both，准备跑 ViT 多尺度
+    if hasattr(algorithm, 'eval_branch'):
+        algorithm.eval_branch = 'both'
+        if args.local_rank in [-1, 0]:
+            logging.info("🌟 [Final Testing] Fully utilizing CNN + MuRF ViT on Target Domains!")
+
     is_dual_stream = ('cnn_auc' in val_metrics and 'vit_auc' in val_metrics)
     if is_dual_stream:
         branches_to_test = ['cnn', 'vit']
